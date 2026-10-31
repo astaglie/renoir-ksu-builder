@@ -6,7 +6,7 @@ on:
       branch:
         description: "Branch kernel di MiCode/Xiaomi_Kernel_OpenSource"
         required: true
-        default: "renoir-t-oss"
+        default: "star-r-oss"
       clang_version:
         description: "Versi clang dari apt (14-17)"
         required: true
@@ -55,8 +55,8 @@ jobs:
         run: |
           URL=https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git
           if ! git ls-remote --exit-code --heads "$URL" "$BRANCH" >/dev/null; then
-            echo "::error::Branch '$BRANCH' tidak ada. Branch yang mengandung 'renoir':"
-            git ls-remote --heads "$URL" | grep -i renoir || echo "(tidak ada yang cocok)"
+            echo "::error::Branch '$BRANCH' tidak ada. Branch yang tersedia:"
+            git ls-remote --heads "$URL" | sed 's#.*refs/heads/##' | grep -E "star|renoir|haydn|venus|courbet" || true
             exit 1
           fi
 
@@ -66,8 +66,10 @@ jobs:
         run: |
           git clone --depth=1 --single-branch -b "$BRANCH" \
             https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git kernel-source
-          echo "Defconfig renoir yang ada di source:"
-          ls kernel-source/arch/arm64/configs | grep -i renoir || true
+          echo "=== Defconfig yang mengandung renoir/star ==="
+          find kernel-source/arch/arm64/configs -iname '*renoir*' -o -iname '*star*' | head -20
+          echo "=== Versi kernel ==="
+          head -5 kernel-source/Makefile
 
       - name: Pasang defconfig kamu
         run: |
@@ -122,8 +124,6 @@ jobs:
             echo "Patch SUSFS berhasil: $PATCH"
           else
             echo "::warning::Patch SUSFS tidak cocok dengan source kernel ini. Lanjut tanpa SUSFS."
-            git checkout -- fs include 2>/dev/null
-            git clean -fdq fs include 2>/dev/null
           fi
           exit 0
 
