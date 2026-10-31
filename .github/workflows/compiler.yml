@@ -7,29 +7,13 @@ on:
         description: "Branch/tag dari MoRanYue/renoir-kernel"
         required: true
         default: "main"
-      root:
-        description: "Root yang dipasang"
-        required: true
-        type: choice
-        default: "sukisu"
-        options:
-          - sukisu
-          - bakasu
-      hook_mode:
-        description: "Mode hook SukiSU (hanya untuk sukisu)"
-        required: true
-        type: choice
-        default: "tamper"
-        options:
-          - tamper
-          - branchlink
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 340
     steps:
-      - name: Checkout kernel (beserta submodule)
+      - name: Checkout kernel (beserta submodule BakaSU)
         uses: actions/checkout@v4
         with:
           repository: MoRanYue/renoir-kernel
@@ -52,6 +36,7 @@ jobs:
             bc bison build-essential ccache curl flex git gperf patch dwarves \
             libssl-dev libncurses-dev libelf-dev lz4 lzop rsync zip zlib1g-dev python3 cpio xz-utils \
             gcc-aarch64-linux-gnu
+          # clang AOSP lama kadang mencari libtinfo.so.5
           sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5 || true
           sudo ln -sf /usr/bin/python3 /usr/local/bin/python2
           sudo ln -sf /usr/bin/python3 /usr/local/bin/python
@@ -65,23 +50,7 @@ jobs:
           rm -f tc/clang.tar.gz
           tc/clang-r383902b/bin/clang --version
 
-      - name: Ganti root ke SukiSU Ultra (branch builtin)
-        if: ${{ inputs.root == 'sukisu' }}
-        run: |
-          cd kernel
-          echo "=== Titik hook BakaSU yang ada di tree (untuk diagnosa) ==="
-          grep -rnE "ksu_handle_|CONFIG_KSU" fs kernel security include drivers/input drivers/android arch 2>/dev/null | grep -v "^drivers/kernelsu" | head -80 || true
-          rm -rf KernelSU drivers/kernelsu
-          git clone --depth=1 -b builtin https://github.com/SukiSU-Ultra/SukiSU-Ultra.git KernelSU
-          ln -sfn ../KernelSU/kernel drivers/kernelsu
-          echo "=== Isi drivers/kernelsu ==="
-          ls drivers/kernelsu | head -30
-          git -C KernelSU log -1 --oneline
-
       - name: Build kernel
-        env:
-          ROOT_MODE: ${{ inputs.root }}
-          HOOK_MODE: ${{ inputs.hook_mode }}
         run: |
           cd kernel
           export TC="$GITHUB_WORKSPACE/tc/clang-r383902b/bin"
@@ -107,22 +76,11 @@ jobs:
             KCFLAGS=-fno-temp-file
           )
 
-          # 1. config bawaan tree
+          # 1. config bawaan tree (sudah disetel agar modul vendor tetap cocok)
           bash scripts/gki/generate_defconfig.sh vendor/renoir-qgki_defconfig
           mkdir -p "$OUT_DIR"
           cp arch/arm64/configs/vendor/renoir-qgki_defconfig "$OUT_DIR/.config"
           make O="$OUT_DIR" "${MAKE_TOOLS[@]}" olddefconfig
-
-          # 2. atur root SukiSU (tanpa hook manual)
-          if [ "$ROOT_MODE" = "sukisu" ]; then
-            ./scripts/config --file "$OUT_DIR/.config" -d KSU_MANUAL_HOOK -e KSU
-            if [ "$HOOK_MODE" = "branchlink" ]; then
-              ./scripts/config --file "$OUT_DIR/.config" -d KSU_TAMPER_SYSCALL_TABLE -e KSU_HACK_ARM64_BRANCH_LINK
-            else
-              ./scripts/config --file "$OUT_DIR/.config" -d KSU_HACK_ARM64_BRANCH_LINK -e KSU_TAMPER_SYSCALL_TABLE
-            fi
-            make O="$OUT_DIR" "${MAKE_TOOLS[@]}" olddefconfig
-          fi
 
           # vdso32 butuh assembler ARM32 yang tidak ada di runner
           if grep -q "^CONFIG_COMPAT_VDSO=y" "$OUT_DIR/.config"; then
@@ -136,12 +94,8 @@ jobs:
             echo "::error::LTO_CLANG hilang dari .config (toolchain tidak terdeteksi benar). Berhenti."
             exit 1
           fi
-          if ! grep -q "^CONFIG_KSU=y" "$OUT_DIR/.config"; then
-            echo "::error::CONFIG_KSU tidak aktif di .config. Berhenti."
-            exit 1
-          fi
 
-          # 3. compile
+          # 2. compile
           if ! make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -j"$JOBS" Image > build.log 2>&1; then
             echo "Build gagal. Ulang 1 thread untuk nampilin error asli..."
             make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -j1 Image > build-retry.log 2>&1 || true
@@ -156,7 +110,6 @@ jobs:
           cp "$OUT_DIR/arch/arm64/boot/Image" "$GITHUB_WORKSPACE/result/"
           cp "$OUT_DIR/.config" "$GITHUB_WORKSPACE/result/config.txt"
           cp "$OUT_DIR/include/config/kernel.release" "$GITHUB_WORKSPACE/result/" || true
-          echo "root=$ROOT_MODE hook=$HOOK_MODE" > "$GITHUB_WORKSPACE/result/info.txt"
           (cd "$GITHUB_WORKSPACE/result" && sha256sum Image > Image.sha256 && ls -la)
 
       - name: Upload kernel
