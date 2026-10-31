@@ -1,3 +1,75 @@
+name: Renoir JP Kernel Build (SukiSU + SUSFS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch kernel di MiCode/Xiaomi_Kernel_OpenSource"
+        required: true
+        default: "star-r-oss"
+      clang_version:
+        description: "Versi clang dari apt (14-17)"
+        required: true
+        default: "14"
+      ksu_branch:
+        description: "Branch setup.sh SukiSU (nongki / susfs-main / main)"
+        required: true
+        default: "nongki"
+      enable_susfs:
+        description: "Coba pasang SUSFS (true/false)"
+        required: true
+        default: "true"
+      susfs_branch:
+        description: "Branch susfs4ksu (gitlab simonpunk)"
+        required: true
+        default: "kernel-5.4"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repo (ambil defconfig kamu)
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          CLANG_VER: ${{ inputs.clang_version }}
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex git gperf patch \
+            libssl-dev libncurses-dev libelf-dev lz4 lzop rsync zip zlib1g-dev python3 cpio xz-utils \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            clang-${CLANG_VER} lld-${CLANG_VER} llvm-${CLANG_VER}
+          /usr/lib/llvm-${CLANG_VER}/bin/clang --version
+
+      - name: Cek branch kernel
+        env:
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          URL=https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git
+          if ! git ls-remote --exit-code --heads "$URL" "$BRANCH" >/dev/null; then
+            echo "::error::Branch '$BRANCH' tidak ada. Branch yang tersedia:"
+            git ls-remote --heads "$URL" | sed 's#.*refs/heads/##' | grep -E "star|renoir|haydn|venus|courbet" || true
+            exit 1
+          fi
+
+      - name: Clone kernel source
+        env:
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          git clone --depth=1 --single-branch -b "$BRANCH" \
+            https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git kernel-source
+          echo "=== Defconfig yang mengandung renoir/star ==="
+          find kernel-source/arch/arm64/configs -iname '*renoir*' -o -iname '*star*' | head -20
+          echo "=== Versi kernel ==="
+          head -5 kernel-source/Makefile
 
       - name: Pasang defconfig kamu
         run: |
