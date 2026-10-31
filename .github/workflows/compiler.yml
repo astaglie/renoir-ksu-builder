@@ -18,8 +18,9 @@ jobs:
         run: |
           mkdir clang
           cd clang
-          curl -LO "https://googlesource.com"
-          tar -xf clang-r450784d.tar.gz
+          curl -L "https://googlesource.com" -o clang.tar.gz
+          tar -xf clang.tar.gz
+          rm -f clang.tar.gz
           cd ..
 
       - name: Clone Kernel Source
