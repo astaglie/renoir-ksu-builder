@@ -18,9 +18,9 @@ jobs:
         run: |
           mkdir clang
           cd clang
-          curl -L "https://googlesource.com" -o clang.tar.gz
-          tar -xf clang.tar.gz
-          rm -f clang.tar.gz
+          curl -LO "https://github.com"
+          tar -xf Clang-14.0.6-20220904-release.tar.gz
+          rm -f Clang-14.0.6-20220904-release.tar.gz
           cd ..
 
       - name: Clone Kernel Source
