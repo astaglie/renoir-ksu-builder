@@ -75,6 +75,17 @@ jobs:
           echo "=== Versi kernel ==="
           head -5 kernel-source/Makefile
 
+      - name: Perbaiki gcc-wrapper.py (sintaks Python 2 -> pass-through)
+        run: |
+          cat > kernel-source/scripts/gcc-wrapper.py << 'EOF'
+          #!/usr/bin/env python3
+          import os
+          import sys
+          os.execvp(sys.argv[1], sys.argv[1:])
+          EOF
+          chmod +x kernel-source/scripts/gcc-wrapper.py
+          cat kernel-source/scripts/gcc-wrapper.py
+
       - name: Pasang defconfig kamu
         run: |
           D=kernel-source/arch/arm64/configs/renoir_jp_defconfig
