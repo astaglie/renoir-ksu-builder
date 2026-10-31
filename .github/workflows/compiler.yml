@@ -84,7 +84,15 @@ jobs:
           os.execvp(sys.argv[1], sys.argv[1:])
           EOF
           chmod +x kernel-source/scripts/gcc-wrapper.py
-          cat kernel-source/scripts/gcc-wrapper.py
+
+      - name: Perbaiki suspend.c (fungsi debug Qualcomm tidak ter-deklarasi)
+        run: |
+          F=kernel-source/kernel/power/suspend.c
+          echo "=== Sebelum ==="
+          grep -n "pm_system_dbg_info_print" "$F" || true
+          sed -i -E 's/pm_system_dbg_info_print\([^)]*\);/do {} while (0);/' "$F"
+          echo "=== Sesudah (harus kosong) ==="
+          grep -n "pm_system_dbg_info_print" "$F" || echo "(bersih)"
 
       - name: Pasang defconfig kamu
         run: |
