@@ -48,6 +48,10 @@ jobs:
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
             clang-${CLANG_VER} lld-${CLANG_VER} llvm-${CLANG_VER}
           /usr/lib/llvm-${CLANG_VER}/bin/clang --version
+          # Kernel lama manggil python2, Ubuntu 24.04 cuma punya python3
+          sudo ln -sf /usr/bin/python3 /usr/local/bin/python2
+          sudo ln -sf /usr/bin/python3 /usr/local/bin/python
+          python2 --version
 
       - name: Cek branch kernel
         env:
@@ -153,7 +157,7 @@ jobs:
           ARGS="O=out LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
           make $ARGS renoir_jp_defconfig
           echo "=== Status KSU/SUSFS di .config ==="
-          grep -E "CONFIG_KSU|CONFIG_KPM" out/.config || echo "(tidak ada CONFIG_KSU di .config!)"
+          grep -E "CONFIG_KSU|CONFIG_KPM|SUSFS" out/.config || echo "(tidak ada CONFIG_KSU di .config!)"
           if ! make -j"$(nproc --all)" $ARGS > build.log 2>&1; then
             echo "Build gagal. Ulang 1 thread untuk nampilin error asli..."
             make -j1 $ARGS > build-retry.log 2>&1 || true
