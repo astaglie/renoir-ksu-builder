@@ -1,35 +1,42 @@
-name: Renoir JP Kernel Build (SukiSU + SUSFS)
+name: Renoir Kernel Build (MoRanYue tree + AOSP clang 11)
 
 on:
   workflow_dispatch:
     inputs:
-      branch:
-        description: "Branch kernel di MiCode/Xiaomi_Kernel_OpenSource"
+      ref:
+        description: "Branch/tag dari MoRanYue/renoir-kernel"
         required: true
-        default: "star-r-oss"
-      clang_version:
-        description: "Versi clang dari apt (14-17)"
+        default: "main"
+      root:
+        description: "Root yang dipasang"
         required: true
-        default: "14"
-      ksu_branch:
-        description: "Branch setup.sh SukiSU (nongki / susfs-main / main)"
+        type: choice
+        default: "sukisu"
+        options:
+          - sukisu
+          - bakasu
+      hook_mode:
+        description: "Mode hook SukiSU (hanya untuk sukisu)"
         required: true
-        default: "nongki"
-      enable_susfs:
-        description: "Coba pasang SUSFS (true/false)"
-        required: true
-        default: "true"
-      susfs_branch:
-        description: "Branch susfs4ksu (gitlab simonpunk)"
-        required: true
-        default: "kernel-5.4"
+        type: choice
+        default: "tamper"
+        options:
+          - tamper
+          - branchlink
 
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 340
     steps:
-      - name: Checkout repo (ambil defconfig kamu)
+      - name: Checkout kernel (beserta submodule)
         uses: actions/checkout@v4
+        with:
+          repository: MoRanYue/renoir-kernel
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+          fetch-depth: 1
+          path: kernel
 
       - name: Free disk space
         run: |
@@ -39,150 +46,105 @@ jobs:
       - name: Install dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
-          CLANG_VER: ${{ inputs.clang_version }}
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ccache curl flex git gperf patch \
+            bc bison build-essential ccache curl flex git gperf patch dwarves \
             libssl-dev libncurses-dev libelf-dev lz4 lzop rsync zip zlib1g-dev python3 cpio xz-utils \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
-            clang-${CLANG_VER} lld-${CLANG_VER} llvm-${CLANG_VER}
-          /usr/lib/llvm-${CLANG_VER}/bin/clang --version
-          # Kernel lama manggil python2, Ubuntu 24.04 cuma punya python3
+            gcc-aarch64-linux-gnu
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5 || true
           sudo ln -sf /usr/bin/python3 /usr/local/bin/python2
           sudo ln -sf /usr/bin/python3 /usr/local/bin/python
-          python2 --version
 
-      - name: Cek branch kernel
-        env:
-          BRANCH: ${{ inputs.branch }}
+      - name: Download AOSP clang 11 (r383902b)
         run: |
-          URL=https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git
-          if ! git ls-remote --exit-code --heads "$URL" "$BRANCH" >/dev/null; then
-            echo "::error::Branch '$BRANCH' tidak ada. Branch yang tersedia:"
-            git ls-remote --heads "$URL" | sed 's#.*refs/heads/##' | grep -E "star|renoir|haydn|venus|courbet" || true
+          mkdir -p tc/clang-r383902b
+          curl -fL --retry 5 --retry-delay 10 -o tc/clang.tar.gz \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-release/clang-r383902b.tar.gz"
+          tar xzf tc/clang.tar.gz -C tc/clang-r383902b
+          rm -f tc/clang.tar.gz
+          tc/clang-r383902b/bin/clang --version
+
+      - name: Ganti root ke SukiSU Ultra (branch builtin)
+        if: ${{ inputs.root == 'sukisu' }}
+        run: |
+          cd kernel
+          echo "=== Titik hook BakaSU yang ada di tree (untuk diagnosa) ==="
+          grep -rnE "ksu_handle_|CONFIG_KSU" fs kernel security include drivers/input drivers/android arch 2>/dev/null | grep -v "^drivers/kernelsu" | head -80 || true
+          rm -rf KernelSU drivers/kernelsu
+          git clone --depth=1 -b builtin https://github.com/SukiSU-Ultra/SukiSU-Ultra.git KernelSU
+          ln -sfn ../KernelSU/kernel drivers/kernelsu
+          echo "=== Isi drivers/kernelsu ==="
+          ls drivers/kernelsu | head -30
+          git -C KernelSU log -1 --oneline
+
+      - name: Build kernel
+        env:
+          ROOT_MODE: ${{ inputs.root }}
+          HOOK_MODE: ${{ inputs.hook_mode }}
+        run: |
+          cd kernel
+          export TC="$GITHUB_WORKSPACE/tc/clang-r383902b/bin"
+          export PATH="$TC:$PATH"
+          export KROOT="$PWD"
+          export OUT_DIR="$PWD/out"
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export REAL_CC=clang
+          export HOSTCC=gcc HOSTLD=ld HOSTAR=ar
+          export LD=ld.lld
+          export TARGET_BUILD_VARIANT=user
+          export ENABLE_MIUI_DEBUGGING=false
+          export DISABLE_WRAPPER=1
+          JOBS="$(nproc)"
+
+          MAKE_TOOLS=(
+            CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump READELF=llvm-readelf STRIP=llvm-strip
+            HOSTCC=gcc HOSTLD=ld HOSTAR=ar
+            ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu-
+            KCFLAGS=-fno-temp-file
+          )
+
+          # 1. config bawaan tree
+          bash scripts/gki/generate_defconfig.sh vendor/renoir-qgki_defconfig
+          mkdir -p "$OUT_DIR"
+          cp arch/arm64/configs/vendor/renoir-qgki_defconfig "$OUT_DIR/.config"
+          make O="$OUT_DIR" "${MAKE_TOOLS[@]}" olddefconfig
+
+          # 2. atur root SukiSU (tanpa hook manual)
+          if [ "$ROOT_MODE" = "sukisu" ]; then
+            ./scripts/config --file "$OUT_DIR/.config" -d KSU_MANUAL_HOOK -e KSU
+            if [ "$HOOK_MODE" = "branchlink" ]; then
+              ./scripts/config --file "$OUT_DIR/.config" -d KSU_TAMPER_SYSCALL_TABLE -e KSU_HACK_ARM64_BRANCH_LINK
+            else
+              ./scripts/config --file "$OUT_DIR/.config" -d KSU_HACK_ARM64_BRANCH_LINK -e KSU_TAMPER_SYSCALL_TABLE
+            fi
+            make O="$OUT_DIR" "${MAKE_TOOLS[@]}" olddefconfig
+          fi
+
+          # vdso32 butuh assembler ARM32 yang tidak ada di runner
+          if grep -q "^CONFIG_COMPAT_VDSO=y" "$OUT_DIR/.config"; then
+            ./scripts/config --file "$OUT_DIR/.config" -d COMPAT_VDSO
+            make O="$OUT_DIR" "${MAKE_TOOLS[@]}" olddefconfig
+          fi
+
+          echo "=== Cek config penting ==="
+          grep -E "CONFIG_LTO_CLANG|CONFIG_CFI_CLANG|CONFIG_SHADOW_CALL_STACK|CONFIG_KSU|KMI_CRC_BYPASS|KMI_VENDOR_SHIM|CONFIG_DEBUG_INFO_BTF" "$OUT_DIR/.config" || true
+          if ! grep -q "^CONFIG_LTO_CLANG=y" "$OUT_DIR/.config"; then
+            echo "::error::LTO_CLANG hilang dari .config (toolchain tidak terdeteksi benar). Berhenti."
+            exit 1
+          fi
+          if ! grep -q "^CONFIG_KSU=y" "$OUT_DIR/.config"; then
+            echo "::error::CONFIG_KSU tidak aktif di .config. Berhenti."
             exit 1
           fi
 
-      - name: Clone kernel source
-        env:
-          BRANCH: ${{ inputs.branch }}
-        run: |
-          git clone --depth=1 --single-branch -b "$BRANCH" \
-            https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git kernel-source
-          echo "=== Defconfig yang mengandung renoir/star ==="
-          find kernel-source/arch/arm64/configs -iname '*renoir*' -o -iname '*star*' | head -20
-          echo "=== Versi kernel ==="
-          head -5 kernel-source/Makefile
-
-      - name: Perbaiki gcc-wrapper.py (sintaks Python 2 -> pass-through)
-        run: |
-          cat > kernel-source/scripts/gcc-wrapper.py << 'EOF'
-          #!/usr/bin/env python3
-          import os
-          import sys
-          os.execvp(sys.argv[1], sys.argv[1:])
-          EOF
-          chmod +x kernel-source/scripts/gcc-wrapper.py
-
-      - name: Perbaiki suspend.c (fungsi debug Qualcomm tidak ter-deklarasi)
-        run: |
-          F=kernel-source/kernel/power/suspend.c
-          echo "=== Sebelum ==="
-          grep -n "pm_system_dbg_info_print" "$F" || true
-          sed -i -E 's/pm_system_dbg_info_print\([^)]*\);/do {} while (0);/' "$F"
-          echo "=== Sesudah (harus kosong) ==="
-          grep -n "pm_system_dbg_info_print" "$F" || echo "(bersih)"
-
-      - name: Pasang defconfig kamu
-        run: |
-          D=kernel-source/arch/arm64/configs/renoir_jp_defconfig
-          cp renoir_jp_defconfig "$D"
-          # Hapus baris lama biar tidak dobel, lalu matikan vdso32 (butuh assembler ARM32)
-          sed -i -E '/^(CONFIG_KPROBES|CONFIG_HAVE_KPROBES|CONFIG_KPROBE_EVENTS|CONFIG_KSU|CONFIG_KPM|CONFIG_KALLSYMS|CONFIG_KALLSYMS_ALL|CONFIG_COMPAT_VDSO)=/d' "$D"
-          sed -i -E '/^# CONFIG_COMPAT_VDSO is not set/d' "$D"
-          {
-            echo ""
-            echo "CONFIG_KPROBES=y"
-            echo "CONFIG_HAVE_KPROBES=y"
-            echo "CONFIG_KPROBE_EVENTS=y"
-            echo "CONFIG_KSU=y"
-            echo "CONFIG_KPM=y"
-            echo "CONFIG_KALLSYMS=y"
-            echo "CONFIG_KALLSYMS_ALL=y"
-            echo "# CONFIG_COMPAT_VDSO is not set"
-          } >> "$D"
-
-      - name: Integrasi SukiSU Ultra
-        env:
-          KSU_BRANCH: ${{ inputs.ksu_branch }}
-        run: |
-          cd kernel-source
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s "$KSU_BRANCH"
-
-      - name: Pasang SUSFS (kalau gagal, build lanjut tanpa SUSFS)
-        if: ${{ inputs.enable_susfs == 'true' }}
-        env:
-          SUSFS_BRANCH: ${{ inputs.susfs_branch }}
-        run: |
-          set +e
-          echo "SUSFS_OK=false" >> "$GITHUB_ENV"
-
-          if ! git clone --depth=1 -b "$SUSFS_BRANCH" https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu; then
-            echo "::warning::Branch susfs4ksu '$SUSFS_BRANCH' tidak bisa di-clone. Lanjut tanpa SUSFS."
-            git ls-remote --heads https://gitlab.com/simonpunk/susfs4ksu.git
-            exit 0
-          fi
-
-          PATCH=$(ls susfs4ksu/kernel_patches/50_add_susfs_in_*.patch 2>/dev/null | head -n1)
-          if [ -z "$PATCH" ]; then
-            echo "::warning::File patch SUSFS tidak ditemukan. Lanjut tanpa SUSFS."
-            exit 0
-          fi
-
-          cd kernel-source
-          if patch -p1 --dry-run -s < "../$PATCH" > /tmp/dry.log 2>&1; then
-            cp -rv ../susfs4ksu/kernel_patches/fs/. fs/
-            cp -rv ../susfs4ksu/kernel_patches/include/linux/. include/linux/
-            patch -p1 --no-backup-if-mismatch < "../$PATCH"
-            echo "SUSFS_OK=true" >> "$GITHUB_ENV"
-            echo "Patch SUSFS berhasil: $PATCH"
-          else
-            echo "::warning::Patch SUSFS tidak cocok dengan source kernel ini. Lanjut tanpa SUSFS."
-            grep -E "FAILED|can't find file" /tmp/dry.log | head -20
-          fi
-          exit 0
-
-      - name: Aktifkan config SUSFS
-        if: ${{ env.SUSFS_OK == 'true' }}
-        run: |
-          {
-            echo "CONFIG_KSU_SUSFS=y"
-            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
-            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
-            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
-            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
-            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
-            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
-          } >> kernel-source/arch/arm64/configs/renoir_jp_defconfig
-
-      - name: Compile kernel
-        env:
-          CLANG_VER: ${{ inputs.clang_version }}
-        run: |
-          cd kernel-source
-          export PATH=/usr/lib/llvm-${CLANG_VER}/bin:$PATH
-          export ARCH=arm64
-          export SUBARCH=arm64
-          ARGS="O=out LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error"
-          make $ARGS renoir_jp_defconfig
-          echo "=== Status KSU/SUSFS/VDSO di .config ==="
-          grep -E "CONFIG_KSU|CONFIG_KPM|SUSFS|COMPAT_VDSO" out/.config || echo "(tidak ada CONFIG_KSU di .config!)"
-          if ! make -j"$(nproc --all)" $ARGS > build.log 2>&1; then
+          # 3. compile
+          if ! make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -j"$JOBS" Image > build.log 2>&1; then
             echo "Build gagal. Ulang 1 thread untuk nampilin error asli..."
-            make -j1 $ARGS > build-retry.log 2>&1 || true
+            make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -j1 Image > build-retry.log 2>&1 || true
             echo "===================== BARIS ERROR ====================="
             grep -nE "error:|Error |\*\*\*|No rule|undefined|not found|fatal" build.log build-retry.log | head -40
             echo "================= 40 BARIS TERAKHIR ==================="
@@ -190,18 +152,17 @@ jobs:
             exit 1
           fi
 
-      - name: Kumpulkan hasil
-        run: |
-          mkdir -p result
-          find kernel-source/out/arch/arm64/boot -maxdepth 1 -name 'Image*' -exec cp {} result/ \;
-          find kernel-source/out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} result/ \; 2>/dev/null || true
-          echo "SUSFS aktif: ${SUSFS_OK:-false}" > result/info.txt
-          ls -la result
+          mkdir -p "$GITHUB_WORKSPACE/result"
+          cp "$OUT_DIR/arch/arm64/boot/Image" "$GITHUB_WORKSPACE/result/"
+          cp "$OUT_DIR/.config" "$GITHUB_WORKSPACE/result/config.txt"
+          cp "$OUT_DIR/include/config/kernel.release" "$GITHUB_WORKSPACE/result/" || true
+          echo "root=$ROOT_MODE hook=$HOOK_MODE" > "$GITHUB_WORKSPACE/result/info.txt"
+          (cd "$GITHUB_WORKSPACE/result" && sha256sum Image > Image.sha256 && ls -la)
 
       - name: Upload kernel
         uses: actions/upload-artifact@v4
         with:
-          name: Renoir-JP-SukiSU-Kernel
+          name: Renoir-Kernel-Image
           path: result/
 
       - name: Upload build log
@@ -209,5 +170,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-log
-          path: kernel-source/build*.log
+          path: kernel/build*.log
           if-no-files-found: ignore
