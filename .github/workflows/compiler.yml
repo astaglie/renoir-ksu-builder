@@ -90,6 +90,9 @@ jobs:
         run: |
           D=kernel-source/arch/arm64/configs/renoir_jp_defconfig
           cp renoir_jp_defconfig "$D"
+          # Hapus baris lama biar tidak dobel, lalu matikan vdso32 (butuh assembler ARM32)
+          sed -i -E '/^(CONFIG_KPROBES|CONFIG_HAVE_KPROBES|CONFIG_KPROBE_EVENTS|CONFIG_KSU|CONFIG_KPM|CONFIG_KALLSYMS|CONFIG_KALLSYMS_ALL|CONFIG_COMPAT_VDSO)=/d' "$D"
+          sed -i -E '/^# CONFIG_COMPAT_VDSO is not set/d' "$D"
           {
             echo ""
             echo "CONFIG_KPROBES=y"
@@ -99,6 +102,7 @@ jobs:
             echo "CONFIG_KPM=y"
             echo "CONFIG_KALLSYMS=y"
             echo "CONFIG_KALLSYMS_ALL=y"
+            echo "# CONFIG_COMPAT_VDSO is not set"
           } >> "$D"
 
       - name: Integrasi SukiSU Ultra
@@ -122,7 +126,6 @@ jobs:
             exit 0
           fi
 
-          ls -R susfs4ksu/kernel_patches | head -50
           PATCH=$(ls susfs4ksu/kernel_patches/50_add_susfs_in_*.patch 2>/dev/null | head -n1)
           if [ -z "$PATCH" ]; then
             echo "::warning::File patch SUSFS tidak ditemukan. Lanjut tanpa SUSFS."
@@ -130,15 +133,15 @@ jobs:
           fi
 
           cd kernel-source
-          cp -rv ../susfs4ksu/kernel_patches/fs/. fs/ 2>/dev/null
-          cp -rv ../susfs4ksu/kernel_patches/include/linux/. include/linux/ 2>/dev/null
-
-          if patch -p1 --dry-run < "../$PATCH"; then
+          if patch -p1 --dry-run -s < "../$PATCH" > /tmp/dry.log 2>&1; then
+            cp -rv ../susfs4ksu/kernel_patches/fs/. fs/
+            cp -rv ../susfs4ksu/kernel_patches/include/linux/. include/linux/
             patch -p1 --no-backup-if-mismatch < "../$PATCH"
             echo "SUSFS_OK=true" >> "$GITHUB_ENV"
             echo "Patch SUSFS berhasil: $PATCH"
           else
             echo "::warning::Patch SUSFS tidak cocok dengan source kernel ini. Lanjut tanpa SUSFS."
+            grep -E "FAILED|can't find file" /tmp/dry.log | head -20
           fi
           exit 0
 
@@ -165,10 +168,10 @@ jobs:
           export PATH=/usr/lib/llvm-${CLANG_VER}/bin:$PATH
           export ARCH=arm64
           export SUBARCH=arm64
-          ARGS="O=out LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
+          ARGS="O=out LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- KCFLAGS=-Wno-error"
           make $ARGS renoir_jp_defconfig
-          echo "=== Status KSU/SUSFS di .config ==="
-          grep -E "CONFIG_KSU|CONFIG_KPM|SUSFS" out/.config || echo "(tidak ada CONFIG_KSU di .config!)"
+          echo "=== Status KSU/SUSFS/VDSO di .config ==="
+          grep -E "CONFIG_KSU|CONFIG_KPM|SUSFS|COMPAT_VDSO" out/.config || echo "(tidak ada CONFIG_KSU di .config!)"
           if ! make -j"$(nproc --all)" $ARGS > build.log 2>&1; then
             echo "Build gagal. Ulang 1 thread untuk nampilin error asli..."
             make -j1 $ARGS > build-retry.log 2>&1 || true
