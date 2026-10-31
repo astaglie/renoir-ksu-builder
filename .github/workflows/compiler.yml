@@ -1,66 +1,115 @@
-name: Renoir JP Kernel Build (SukiSU + SUSFS)
 
-on:
-  workflow_dispatch:
-    inputs:
-      branch:
-        description: "Branch kernel di MiCode/Xiaomi_Kernel_OpenSource"
-        required: true
-        default: "star-r-oss"
-      clang_version:
-        description: "Versi clang dari apt (14-17)"
-        required: true
-        default: "14"
-      ksu_branch:
-        description: "Branch setup.sh SukiSU (nongki / susfs-main / main)"
-        required: true
-        default: "nongki"
-      enable_susfs:
-        description: "Coba pasang SUSFS (true/false)"
-        required: true
-        default: "true"
-      susfs_branch:
-        description: "Branch susfs4ksu (gitlab simonpunk)"
-        required: true
-        default: "kernel-5.4"
-
-jobs:
-  build:
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout repo (ambil defconfig kamu)
-        uses: actions/checkout@v4
-
-      - name: Free disk space
+      - name: Pasang defconfig kamu
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
-          df -h /
+          D=kernel-source/arch/arm64/configs/renoir_jp_defconfig
+          cp renoir_jp_defconfig "$D"
+          {
+            echo ""
+            echo "CONFIG_KPROBES=y"
+            echo "CONFIG_HAVE_KPROBES=y"
+            echo "CONFIG_KPROBE_EVENTS=y"
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KPM=y"
+            echo "CONFIG_KALLSYMS=y"
+            echo "CONFIG_KALLSYMS_ALL=y"
+          } >> "$D"
 
-      - name: Install dependencies
+      - name: Integrasi SukiSU Ultra
         env:
-          DEBIAN_FRONTEND: noninteractive
+          KSU_BRANCH: ${{ inputs.ksu_branch }}
+        run: |
+          cd kernel-source
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s "$KSU_BRANCH"
+
+      - name: Pasang SUSFS (kalau gagal, build lanjut tanpa SUSFS)
+        if: ${{ inputs.enable_susfs == 'true' }}
+        env:
+          SUSFS_BRANCH: ${{ inputs.susfs_branch }}
+        run: |
+          set +e
+          echo "SUSFS_OK=false" >> "$GITHUB_ENV"
+
+          if ! git clone --depth=1 -b "$SUSFS_BRANCH" https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu; then
+            echo "::warning::Branch susfs4ksu '$SUSFS_BRANCH' tidak bisa di-clone. Lanjut tanpa SUSFS."
+            git ls-remote --heads https://gitlab.com/simonpunk/susfs4ksu.git
+            exit 0
+          fi
+
+          ls -R susfs4ksu/kernel_patches | head -50
+          PATCH=$(ls susfs4ksu/kernel_patches/50_add_susfs_in_*.patch 2>/dev/null | head -n1)
+          if [ -z "$PATCH" ]; then
+            echo "::warning::File patch SUSFS tidak ditemukan. Lanjut tanpa SUSFS."
+            exit 0
+          fi
+
+          cd kernel-source
+          cp -rv ../susfs4ksu/kernel_patches/fs/. fs/ 2>/dev/null
+          cp -rv ../susfs4ksu/kernel_patches/include/linux/. include/linux/ 2>/dev/null
+
+          if patch -p1 --dry-run < "../$PATCH"; then
+            patch -p1 --no-backup-if-mismatch < "../$PATCH"
+            echo "SUSFS_OK=true" >> "$GITHUB_ENV"
+            echo "Patch SUSFS berhasil: $PATCH"
+          else
+            echo "::warning::Patch SUSFS tidak cocok dengan source kernel ini. Lanjut tanpa SUSFS."
+          fi
+          exit 0
+
+      - name: Aktifkan config SUSFS
+        if: ${{ env.SUSFS_OK == 'true' }}
+        run: |
+          {
+            echo "CONFIG_KSU_SUSFS=y"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
+            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
+          } >> kernel-source/arch/arm64/configs/renoir_jp_defconfig
+
+      - name: Compile kernel
+        env:
           CLANG_VER: ${{ inputs.clang_version }}
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ccache curl flex git gperf patch \
-            libssl-dev libncurses-dev libelf-dev lz4 lzop rsync zip zlib1g-dev python3 cpio xz-utils \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
-            clang-${CLANG_VER} lld-${CLANG_VER} llvm-${CLANG_VER}
-          /usr/lib/llvm-${CLANG_VER}/bin/clang --version
-
-      - name: Cek branch kernel
-        env:
-          BRANCH: ${{ inputs.branch }}
-        run: |
-          URL=https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git
-          if ! git ls-remote --exit-code --heads "$URL" "$BRANCH" >/dev/null; then
-            echo "::error::Branch '$BRANCH' tidak ada. Branch yang tersedia:"
-            git ls-remote --heads "$URL" | sed 's#.*refs/heads/##' | grep -E "star|renoir|haydn|venus|courbet" || true
+          cd kernel-source
+          export PATH=/usr/lib/llvm-${CLANG_VER}/bin:$PATH
+          export ARCH=arm64
+          export SUBARCH=arm64
+          ARGS="O=out LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
+          make $ARGS renoir_jp_defconfig
+          echo "=== Status KSU/SUSFS di .config ==="
+          grep -E "CONFIG_KSU|CONFIG_KPM" out/.config || echo "(tidak ada CONFIG_KSU di .config!)"
+          if ! make -j"$(nproc --all)" $ARGS > build.log 2>&1; then
+            echo "Build gagal. Ulang 1 thread untuk nampilin error asli..."
+            make -j1 $ARGS > build-retry.log 2>&1 || true
+            echo "===================== BARIS ERROR ====================="
+            grep -nE "error:|Error |\*\*\*|No rule|undefined|not found|fatal" build.log build-retry.log | head -40
+            echo "================= 40 BARIS TERAKHIR ==================="
+            tail -n 40 build-retry.log
             exit 1
           fi
 
-      - name: Clone kernel source
-        env:
-          BRANCH: ${{ inputs.branch }}
+      - name: Kumpulkan hasil
         run: |
+          mkdir -p result
+          find kernel-source/out/arch/arm64/boot -maxdepth 1 -name 'Image*' -exec cp {} result/ \;
+          find kernel-source/out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} result/ \; 2>/dev/null || true
+          echo "SUSFS aktif: ${SUSFS_OK:-false}" > result/info.txt
+          ls -la result
+
+      - name: Upload kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: Renoir-JP-SukiSU-Kernel
+          path: result/
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: kernel-source/build*.log
+          if-no-files-found: ignore
