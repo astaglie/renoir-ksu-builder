@@ -160,9 +160,9 @@ jobs:
           cp "$DEF" "$OUT_DIR/.config"
           make O="$OUT_DIR" "${MAKE_TOOLS[@]}" olddefconfig
 
-          # 2. atur root SukiSU (tanpa hook manual)
+          # 2. atur root SukiSU (tanpa hook manual, tanpa SUSFS)
           if [ "$ROOT_MODE" = "sukisu" ]; then
-            ./scripts/config --file "$OUT_DIR/.config" -d KSU_MANUAL_HOOK -e KSU
+            ./scripts/config --file "$OUT_DIR/.config" -d KSU_MANUAL_HOOK -e KSU -d KSU_SUSFS
             if [ "$HOOK_MODE" = "branchlink" ]; then
               ./scripts/config --file "$OUT_DIR/.config" -d KSU_TAMPER_SYSCALL_TABLE -e KSU_HACK_ARM64_BRANCH_LINK
             else
@@ -199,12 +199,23 @@ jobs:
             echo "::error::CONFIG_KSU tidak aktif di .config. Berhenti."
             exit 1
           fi
+          if [ "$ROOT_MODE" = "sukisu" ] && grep -q "^CONFIG_KSU_SUSFS=y" "$OUT_DIR/.config"; then
+            echo "::error::KSU_SUSFS masih aktif padahal source kernel tidak punya SUSFS. Berhenti."
+            exit 1
+          fi
 
           # 4. MODE CEK CEPAT: hanya driver root, tampilkan semua error sekaligus
           if [ "$QUICK" = "true" ]; then
             echo "=== MODE CEK CEPAT: kompilasi drivers/kernelsu saja ==="
             if ! make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -j"$JOBS" prepare scripts > prep.log 2>&1; then
               echo "prepare gagal:"; tail -n 40 prep.log; exit 1
+            fi
+            # compile.h baru dibuat saat init/ dikompilasi
+            make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -k -j"$JOBS" init/ > init.log 2>&1 || true
+            if [ ! -f "$OUT_DIR/include/generated/compile.h" ]; then
+              echo "::error::include/generated/compile.h tidak terbentuk. 30 baris terakhir init.log:"
+              tail -n 30 init.log
+              exit 1
             fi
             make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -k -j"$JOBS" drivers/kernelsu/ > ksu.log 2>&1 || true
             echo "===================== SEMUA ERROR drivers/kernelsu ====================="
