@@ -212,9 +212,14 @@ jobs:
           if ! make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -j"$JOBS" prepare scripts > prep.log 2>&1; then
             echo "prepare gagal:"; tail -n 40 prep.log; exit 1
           fi
-          make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -k -j"$JOBS" init/ security/selinux/ > gen.log 2>&1 || true
-          if [ ! -f "$OUT_DIR/include/generated/compile.h" ] || [ ! -f "$OUT_DIR/security/selinux/flask.h" ]; then
-            echo "::error::compile.h atau flask.h tidak terbentuk. 40 baris terakhir gen.log:"
+          make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -k -j"$JOBS" init/version.o security/selinux/ > gen.log 2>&1 || true
+          if [ ! -f "$OUT_DIR/include/generated/compile.h" ]; then
+            echo "::error::compile.h tidak terbentuk. 40 baris terakhir gen.log:"
+            tail -n 40 gen.log
+            exit 1
+          fi
+          if [ ! -f "$OUT_DIR/security/selinux/flask.h" ]; then
+            echo "::error::flask.h tidak terbentuk. 40 baris terakhir gen.log:"
             tail -n 40 gen.log
             exit 1
           fi
