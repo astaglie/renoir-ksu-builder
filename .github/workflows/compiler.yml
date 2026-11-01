@@ -114,6 +114,31 @@ jobs:
               || echo "::warning::gagal mengambil arch.h"
           fi
 
+          # 5. vdso_clock_mode baru ada di kernel 5.7+ (kernel ini 5.4): bungkus pernyataan tunggalnya
+          CS=KernelSU/kernel/extension/cpu_spoof.c
+          if [ -f "$CS" ] && ! grep -q "vdso_clock_mode" include/linux/clocksource.h; then
+            echo "=== konteks vdso_clock_mode di cpu_spoof.c (sebelum) ==="
+            grep -n -B3 -A3 "vdso_clock_mode" "$CS" || true
+            awk '
+              /vdso_clock_mode/ && $0 !~ /^[[:space:]]*(if|while|for|return|else)/ && $0 ~ /;[[:space:]]*$/ && $0 !~ /^[[:space:]]*#/ {
+                print "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)"; print; print "#endif"; next }
+              { print }' "$CS" > "$CS.new" && mv "$CS.new" "$CS"
+            echo "=== sesudah ==="
+            grep -n -B1 -A1 "vdso_clock_mode" "$CS" || true
+          fi
+
+          # 6. fungsi SUSFS dipanggil walau SUSFS tidak terpasang di source kernel
+          PO=KernelSU/kernel/manager/pkg_observer.c
+          if [ -f "$PO" ]; then
+            echo "=== konteks susfs di pkg_observer.c ==="
+            grep -n -B4 -A2 "susfs" "$PO" | head -60 || true
+            if grep -q "susfs_parse_priority_app_strings" "$PO" && ! grep -rq "susfs_parse_priority_app_strings" include/linux 2>/dev/null; then
+              line=$(grep -n '^#include' "$PO" | tail -1 | cut -d: -f1)
+              sed -i "${line}a #ifndef susfs_parse_priority_app_strings\n#define susfs_parse_priority_app_strings(...) (0)\n#endif" "$PO"
+              echo "stub susfs_parse_priority_app_strings dipasang"
+            fi
+          fi
+
           echo "=== Cek simbol: dipakai hook di kernel vs ada di SukiSU ==="
           for s in $(grep -ohE "ksu_[a-z0-9_]+" fs/exec.c fs/open.c fs/stat.c fs/read_write.c kernel/sys.c kernel/reboot.c drivers/input/input.c 2>/dev/null | sort -u); do
             if grep -rqE "\b$s\b" KernelSU/kernel; then echo "OK       $s"; else echo "MISSING  $s"; fi
@@ -228,6 +253,8 @@ jobs:
           if [ "$QUICK" = "true" ]; then
             echo "=== MODE CEK CEPAT: kompilasi drivers/kernelsu saja ==="
             make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -k -j"$JOBS" drivers/kernelsu/ > ksu.log 2>&1 || true
+            echo "=== Pesan Kbuild SukiSU ==="
+            grep -n "^-- " ksu.log | head -20 || true
             echo "===================== SEMUA ERROR drivers/kernelsu ====================="
             grep -nE "error:|fatal error|undefined" ksu.log | head -60 || true
             if grep -qE "error:|fatal error" ksu.log; then
