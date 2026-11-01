@@ -27,11 +27,15 @@ on:
         description: "Branch/tag SukiSU-Ultra"
         required: true
         default: "builtin"
+      uapi_version:
+        description: "Opsional: paksa KERNEL_SU_UAPI_VERSION (angka, samakan dengan manager/ksud). Kosong = jangan diubah"
+        required: false
+        default: ""
       quick_check:
         description: "Cek cepat: hanya kompilasi drivers/kernelsu (tanpa build penuh)"
         required: true
         type: boolean
-        default: true
+        default: false
 
 jobs:
   build:
@@ -78,6 +82,7 @@ jobs:
         if: ${{ inputs.root == 'sukisu' }}
         env:
           SUKI_REF: ${{ inputs.suki_ref }}
+          KSU_UAPI: ${{ inputs.uapi_version }}
         run: |
           cd kernel
           echo "=== Hook BakaSU yang ada di source (konteks guard) ==="
@@ -114,17 +119,30 @@ jobs:
               || echo "::warning::gagal mengambil arch.h"
           fi
 
-          # 5. vdso_clock_mode baru ada di kernel 5.7+ (kernel ini 5.4): bungkus pernyataan tunggalnya
-          CS=KernelSU/kernel/extension/cpu_spoof.c
-          if [ -f "$CS" ] && ! grep -q "vdso_clock_mode" include/linux/clocksource.h; then
-            echo "=== konteks vdso_clock_mode di cpu_spoof.c (sebelum) ==="
-            grep -n -B3 -A3 "vdso_clock_mode" "$CS" || true
+          # 5. cpu_spoof.c memakai clocksource->vdso_clock_mode (baru ada di kernel 5.10+).
+          #    Kernel 5.4 tidak punya field ini. Solusi: tambahkan field int di AKHIR struct clocksource
+          #    (offset field lain tidak berubah, vDSO 5.4 tidak membacanya) sehingga cpu_spoof.c
+          #    tetap compile tanpa diubah dan simbol extension hub tetap lengkap.
+          CLK=include/linux/clocksource.h
+          if grep -rq "vdso_clock_mode" KernelSU/kernel && ! grep -q "vdso_clock_mode" "$CLK"; then
+            echo "=== pemakaian vdso_clock_mode di SukiSU ==="
+            grep -rn "vdso_clock_mode" KernelSU/kernel || true
             awk '
-              /vdso_clock_mode/ && $0 !~ /^[[:space:]]*(if|while|for|return|else)/ && $0 ~ /;[[:space:]]*$/ && $0 !~ /^[[:space:]]*#/ {
-                print "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)"; print; print "#endif"; next }
-              { print }' "$CS" > "$CS.new" && mv "$CS.new" "$CS"
-            echo "=== sesudah ==="
-            grep -n -B1 -A1 "vdso_clock_mode" "$CS" || true
+              /^struct clocksource[[:space:]]*\{/ { in_cs=1 }
+              in_cs && /^\}.*;/ {
+                print "\t/* compat 5.4: dipakai SukiSU cpu_spoof, tidak dibaca vDSO kernel 5.4 */"
+                print "\tint vdso_clock_mode;"
+                in_cs=0
+              }
+              { print }
+            ' "$CLK" > "$CLK.new" && mv "$CLK.new" "$CLK"
+            if ! grep -q "int vdso_clock_mode;" "$CLK"; then
+              echo "::error::Gagal menyisipkan vdso_clock_mode ke struct clocksource ($CLK)"
+              grep -n -A40 "^struct clocksource" "$CLK" | head -80
+              exit 1
+            fi
+            echo "=== clocksource.h sesudah patch ==="
+            grep -n -B3 -A2 "vdso_clock_mode" "$CLK"
           fi
 
           # 6. fungsi SUSFS dipanggil walau SUSFS tidak terpasang di source kernel
@@ -137,6 +155,20 @@ jobs:
               sed -i "${line}a #ifndef susfs_parse_priority_app_strings\n#define susfs_parse_priority_app_strings(...) (0)\n#endif" "$PO"
               echo "stub susfs_parse_priority_app_strings dipasang"
             fi
+          fi
+
+          # 7. opsional: samakan KERNEL_SU_UAPI_VERSION dengan manager/ksud (SukiSU-Ultra issue #996)
+          if [ -n "$KSU_UAPI" ]; then
+            if ! [[ "$KSU_UAPI" =~ ^[0-9]+$ ]]; then
+              echo "::error::uapi_version harus berupa angka"; exit 1
+            fi
+            H=KernelSU/kernel/include/uapi/supercall.h
+            [ -f "$H" ] || H=$(grep -rl "KERNEL_SU_UAPI_VERSION" KernelSU/kernel | head -1)
+            echo "=== UAPI sebelum ($H) ==="
+            grep -n "KERNEL_SU_UAPI_VERSION" "$H" || true
+            sed -i -E "s/(KERNEL_SU_UAPI_VERSION,[[:space:]]*)[0-9]+/\1${KSU_UAPI}/" "$H"
+            echo "=== UAPI sesudah ==="
+            grep -n "KERNEL_SU_UAPI_VERSION" "$H" || echo "::warning::pola KERNEL_SU_UAPI_VERSION tidak ditemukan, tidak ada yang diubah"
           fi
 
           echo "=== Cek simbol: dipakai hook di kernel vs ada di SukiSU ==="
