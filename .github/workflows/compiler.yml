@@ -32,10 +32,10 @@ on:
         required: false
         default: ""
       disable_preinit:
-        description: "Matikan preinit SukiSU (-DKSU_NO_PREINIT). Pakai kalau preinit masih error"
+        description: "Matikan preinit SukiSU (disarankan untuk kernel 5.4)"
         required: true
         type: boolean
-        default: false
+        default: true
       quick_check:
         description: "Cek cepat: hanya kompilasi drivers/kernelsu (tanpa build penuh)"
         required: true
@@ -88,6 +88,7 @@ jobs:
         env:
           SUKI_REF: ${{ inputs.suki_ref }}
           KSU_UAPI: ${{ inputs.uapi_version }}
+          NO_PREINIT: ${{ inputs.disable_preinit }}
         run: |
           cd kernel
           echo "=== Hook BakaSU yang ada di source (konteks guard) ==="
@@ -175,23 +176,33 @@ jobs:
             grep -n "KERNEL_SU_UAPI_VERSION" "$H" || echo "::warning::pola KERNEL_SU_UAPI_VERSION tidak ditemukan, tidak ada yang diubah"
           fi
 
-          # 8. file .c SukiSU (mis. preinit/preinit.c) memakai uint32_t/uintptr_t, bool/false, get_user
-          #    tanpa include yang cukup di kernel 5.4 -> samakan ke tipe kernel + tambah include dasar
-          for f in $(grep -rlE '\b(uint8_t|uint16_t|uint32_t|uint64_t|uintptr_t|get_user|put_user|copy_from_user|copy_to_user)\b' KernelSU/kernel --include='*.c'); do
-            sed -i -E 's/\buint8_t\b/u8/g; s/\buint16_t\b/u16/g; s/\buint32_t\b/u32/g; s/\buint64_t\b/u64/g; s/\buintptr_t\b/unsigned long/g' "$f"
-            if ! grep -q "ksu_compat_5_4_includes" "$f"; then
-              sed -i '1i /* ksu_compat_5_4_includes */\n#include <linux/types.h>\n#include <linux/kernel.h>\n#include <linux/stddef.h>\n#include <linux/uaccess.h>' "$f"
-              echo "compat include ditambahkan: $f"
+          # 8. preinit SukiSU (preinit/preinit.c + preinit/runner) butuh header userspace
+          #    ($(objtree)/usr/include dari headers_install) dan fitur kernel 5.3+ (struct clone_args).
+          #    Makefile SukiSU mematikannya sendiri bila direktori itu tidak ada. Kita paksa jalur itu
+          #    dengan mengarahkan KSU_UAPI_INC ke direktori yang tidak ada.
+          if [ "$NO_PREINIT" = "true" ]; then
+            echo "=== Makefile/Kbuild SukiSU terkait preinit (sebelum) ==="
+            grep -n -i "KSU_UAPI_INC\|KSU_NO_PREINIT\|preinit" KernelSU/kernel/Makefile KernelSU/kernel/Kbuild 2>/dev/null | head -60 || true
+            for mk in KernelSU/kernel/Makefile KernelSU/kernel/Kbuild; do
+              if [ -f "$mk" ]; then
+                sed -i -E 's|^([[:space:]]*KSU_UAPI_INC[[:space:]]*:?=[[:space:]]*).*$|\1$(objtree)/usr/include-ksu-disabled|' "$mk"
+              fi
+            done
+            echo "=== sesudah ==="
+            grep -n "KSU_UAPI_INC" KernelSU/kernel/Makefile KernelSU/kernel/Kbuild 2>/dev/null || true
+            if ! grep -qs "include-ksu-disabled" KernelSU/kernel/Makefile KernelSU/kernel/Kbuild; then
+              echo "::warning::KSU_UAPI_INC tidak ditemukan di Makefile/Kbuild SukiSU; preinit mungkin masih aktif. Cek bagian 'sebelum' di atas."
             fi
-          done
+          fi
 
-          # 9. diagnostik: hook sucompat di fs/exec.c yang dipanggil dengan NULL,NULL,NULL bisa bikin panic
-          #    saat execve pertama (driver builtin men-dereference argv)
+          # 9. diagnostik hook
           echo "=== Hook execve/sucompat di fs/exec.c ==="
           grep -n "sucompat\|ksu_handle_execve" fs/exec.c || true
           if grep -nE "sucompat[a-z_]*\([^)]*NULL,[[:space:]]*NULL,[[:space:]]*NULL" fs/exec.c >/dev/null 2>&1; then
             echo "::warning::fs/exec.c memanggil sucompat dengan NULL,NULL,NULL. Driver builtin bisa NULL-deref saat execve pertama (boot panic). Pastikan hook meneruskan &argv, &envp."
           fi
+          echo "=== Hook reboot di kernel/reboot.c ==="
+          grep -n "ksu_handle" kernel/reboot.c || echo "(tidak ada hook ksu di kernel/reboot.c)"
 
           echo "=== Cek simbol: dipakai hook di kernel vs ada di SukiSU ==="
           for s in $(grep -ohE "ksu_[a-z0-9_]+" fs/exec.c fs/open.c fs/stat.c fs/read_write.c kernel/sys.c kernel/reboot.c drivers/input/input.c 2>/dev/null | sort -u); do
@@ -224,7 +235,7 @@ jobs:
           export KBUILD_BUILD_HOST="aetherion"
 
           KCFL="-fno-temp-file"
-          if [ "$NO_PREINIT" = "true" ]; then
+          if [ "$ROOT_MODE" = "sukisu" ] && [ "$NO_PREINIT" = "true" ]; then
             KCFL="$KCFL -DKSU_NO_PREINIT"
             echo "preinit dimatikan (-DKSU_NO_PREINIT)"
           fi
@@ -315,7 +326,7 @@ jobs:
             echo "=== Kompilasi drivers/kernelsu (semua error sekaligus) ==="
             make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -k -j"$JOBS" drivers/kernelsu/ > ksu.log 2>&1 || true
             echo "=== Pesan Kbuild SukiSU ==="
-            grep -n "^-- " ksu.log | head -20 || true
+            grep -n "^-- \|preinit" ksu.log | head -30 || true
             echo "===================== SEMUA ERROR drivers/kernelsu ====================="
             grep -nE "error:|fatal error|undefined" ksu.log | head -80 || true
             if grep -qE "error:|fatal error" ksu.log; then
