@@ -140,6 +140,8 @@ jobs:
           export ENABLE_MIUI_DEBUGGING=false
           export DISABLE_WRAPPER=1
           JOBS="$(nproc)"
+          export KBUILD_BUILD_USER="AETHERION"
+          export KBUILD_BUILD_HOST="aetherion"
 
           MAKE_TOOLS=(
             CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy
@@ -173,6 +175,8 @@ jobs:
           # 3. opsi wajib agar modul vendor stock tetap bisa dimuat (lihat README tree)
           REQ="KMI_CRC_BYPASS KMI_VENDOR_SHIM PCIEAER TASK_DELAY_ACCT BLK_WBT QTI_SCMI_PLH_PROTOCOL SONY_FF ZRAM_WRITEBACK"
           for o in $REQ; do ./scripts/config --file "$OUT_DIR/.config" -e "$o"; done
+          # nama kernel (kata "qgki" harus tetap ada)
+          ./scripts/config --file "$OUT_DIR/.config" --set-str LOCALVERSION "-qgki-AETHERION-v0.1" -d LOCALVERSION_AUTO
           make O="$OUT_DIR" "${MAKE_TOOLS[@]}" olddefconfig
 
           # vdso32 butuh assembler ARM32 yang tidak ada di runner
@@ -182,7 +186,7 @@ jobs:
           fi
 
           echo "=== Cek config penting ==="
-          grep -E "CONFIG_LTO_CLANG|CONFIG_CFI_CLANG|CONFIG_SHADOW_CALL_STACK|CONFIG_KSU|KMI_CRC_BYPASS|KMI_VENDOR_SHIM" "$OUT_DIR/.config" || true
+          grep -E "CONFIG_LTO_CLANG|CONFIG_CFI_CLANG|CONFIG_SHADOW_CALL_STACK|CONFIG_KSU|KMI_CRC_BYPASS|KMI_VENDOR_SHIM|CONFIG_LOCALVERSION" "$OUT_DIR/.config" || true
           MISSING=""
           for o in $REQ; do
             grep -q "^CONFIG_$o=y" "$OUT_DIR/.config" || MISSING="$MISSING $o"
@@ -204,19 +208,20 @@ jobs:
             exit 1
           fi
 
-          # 4. MODE CEK CEPAT: hanya driver root, tampilkan semua error sekaligus
+          # 4. siapkan file yang dibuat otomatis (compile.h dan flask.h) sebelum driver root dikompilasi
+          if ! make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -j"$JOBS" prepare scripts > prep.log 2>&1; then
+            echo "prepare gagal:"; tail -n 40 prep.log; exit 1
+          fi
+          make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -k -j"$JOBS" init/ security/selinux/ > gen.log 2>&1 || true
+          if [ ! -f "$OUT_DIR/include/generated/compile.h" ] || [ ! -f "$OUT_DIR/security/selinux/flask.h" ]; then
+            echo "::error::compile.h atau flask.h tidak terbentuk. 40 baris terakhir gen.log:"
+            tail -n 40 gen.log
+            exit 1
+          fi
+
+          # 5. MODE CEK CEPAT: hanya driver root, tampilkan semua error sekaligus
           if [ "$QUICK" = "true" ]; then
             echo "=== MODE CEK CEPAT: kompilasi drivers/kernelsu saja ==="
-            if ! make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -j"$JOBS" prepare scripts > prep.log 2>&1; then
-              echo "prepare gagal:"; tail -n 40 prep.log; exit 1
-            fi
-            # compile.h baru dibuat saat init/ dikompilasi
-            make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -k -j"$JOBS" init/ > init.log 2>&1 || true
-            if [ ! -f "$OUT_DIR/include/generated/compile.h" ]; then
-              echo "::error::include/generated/compile.h tidak terbentuk. 30 baris terakhir init.log:"
-              tail -n 30 init.log
-              exit 1
-            fi
             make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -k -j"$JOBS" drivers/kernelsu/ > ksu.log 2>&1 || true
             echo "===================== SEMUA ERROR drivers/kernelsu ====================="
             grep -nE "error:|fatal error|undefined" ksu.log | head -60 || true
@@ -228,7 +233,7 @@ jobs:
             exit 0
           fi
 
-          # 5. build penuh
+          # 6. build penuh
           if ! make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -j"$JOBS" Image > build.log 2>&1; then
             echo "Build gagal. Ulang 1 thread untuk nampilin error asli..."
             make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -j1 Image > build-retry.log 2>&1 || true
