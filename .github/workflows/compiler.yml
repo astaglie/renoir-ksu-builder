@@ -1,58 +1,41 @@
-name: Renoir Kernel Build (MoRanYue tree + AOSP clang 11)
+name: Renoir MIUI 14 - Kernel Hana + SukiSU Ultra
+
+# Dasar kernel: Hana-kernel (ponces/android_kernel_xiaomi_sm8350-miui, Linux 5.4.283).
+# Kernel Hana versi rilis sudah kamu uji dan bisa boot di MIUI 14-mu.
+# Workflow ini mengganti KernelSU-Next bawaannya dengan SukiSU Ultra (builtin).
 
 on:
   workflow_dispatch:
     inputs:
-      ref:
-        description: "Branch/tag dari MoRanYue/renoir-kernel"
-        required: true
-        default: "main"
       root:
-        description: "Root yang dipasang"
+        description: "sukisu = SukiSU Ultra | ksunext = sama persis dengan rilis Hana (uji dasar) | none = tanpa root"
         required: true
         type: choice
         default: "sukisu"
         options:
           - sukisu
-          - bakasu
-      hook_mode:
-        description: "Mode hook SukiSU (hanya untuk sukisu)"
+          - ksunext
+          - none
+      kernel_ref:
+        description: "Branch/tag kernel Hana"
         required: true
-        type: choice
-        default: "tamper"
-        options:
-          - tamper
-          - branchlink
+        default: "main"
       suki_ref:
-        description: "Branch/tag SukiSU-Ultra"
+        description: "Branch SukiSU-Ultra (hanya kalau root = sukisu)"
         required: true
         default: "builtin"
-      uapi_version:
-        description: "Opsional: paksa KERNEL_SU_UAPI_VERSION (angka, samakan dengan manager/ksud). Kosong = jangan diubah"
-        required: false
-        default: ""
-      disable_preinit:
-        description: "Matikan preinit SukiSU (disarankan untuk kernel 5.4)"
-        required: true
-        type: boolean
-        default: true
-      quick_check:
-        description: "Cek cepat: hanya kompilasi drivers/kernelsu (tanpa build penuh)"
-        required: true
-        type: boolean
-        default: false
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 340
+    timeout-minutes: 360
     steps:
-      - name: Checkout kernel (beserta submodule)
+      - name: Checkout kernel Hana
         uses: actions/checkout@v4
         with:
-          repository: MoRanYue/renoir-kernel
-          ref: ${{ inputs.ref }}
-          submodules: recursive
+          repository: ponces/android_kernel_xiaomi_sm8350-miui
+          ref: ${{ inputs.kernel_ref }}
+          submodules: true
           fetch-depth: 1
           path: kernel
 
@@ -67,71 +50,64 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ccache curl flex git gperf patch dwarves \
-            libssl-dev libncurses-dev libelf-dev lz4 lzop rsync zip zlib1g-dev python3 cpio xz-utils \
-            gcc-aarch64-linux-gnu
-          sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5 || true
-          sudo ln -sf /usr/bin/python3 /usr/local/bin/python2
-          sudo ln -sf /usr/bin/python3 /usr/local/bin/python
+            bc bison build-essential clang curl flex git libssl-dev lld llvm \
+            python3 python-is-python3 zip zstd file cpio xz-utils
+          clang --version | head -1
 
-      - name: Download AOSP clang 11 (r383902b)
+      - name: Info sumber kernel
         run: |
-          mkdir -p tc/clang-r383902b
-          curl -fL --retry 5 --retry-delay 10 -o tc/clang.tar.gz \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-release/clang-r383902b.tar.gz"
-          tar xzf tc/clang.tar.gz -C tc/clang-r383902b
-          rm -f tc/clang.tar.gz
-          tc/clang-r383902b/bin/clang --version
+          cd kernel
+          git log -1 --oneline || true
+          make -s kernelversion
+          ls -la drivers/kernelsu || true
+          ls KernelSU-Next | head -5 || true
 
-      - name: Ganti root ke SukiSU Ultra + penyesuaian kernel 5.4
+      - name: Ganti KernelSU-Next dengan SukiSU Ultra + penyesuaian kernel 5.4
         if: ${{ inputs.root == 'sukisu' }}
         env:
           SUKI_REF: ${{ inputs.suki_ref }}
-          KSU_UAPI: ${{ inputs.uapi_version }}
-          NO_PREINIT: ${{ inputs.disable_preinit }}
         run: |
+          set -e
           cd kernel
-          echo "=== Hook BakaSU yang ada di source (konteks guard) ==="
-          grep -n -B1 "ksu_handle_" fs/exec.c fs/open.c fs/stat.c fs/read_write.c kernel/sys.c kernel/reboot.c drivers/input/input.c 2>/dev/null | head -90 || true
 
-          rm -rf KernelSU drivers/kernelsu
-          git clone --depth=1 -b "$SUKI_REF" https://github.com/SukiSU-Ultra/SukiSU-Ultra.git KernelSU
-          ln -sfn ../KernelSU/kernel drivers/kernelsu
-          git -C KernelSU log -1 --oneline
+          # drivers/kernelsu adalah symlink ke ../KernelSU-Next/kernel (bawaan Hana).
+          # Folder KernelSU-Next kita ganti isinya dengan SukiSU, symlink tetap dipakai.
+          rm -rf KernelSU-Next
+          git clone --single-branch -b "$SUKI_REF" https://github.com/SukiSU-Ultra/SukiSU-Ultra.git KernelSU-Next
+          git -C KernelSU-Next log -1 --oneline
+          test -f KernelSU-Next/kernel/Kconfig || { echo "::error::SukiSU tidak punya kernel/Kconfig di branch $SUKI_REF"; exit 1; }
+          test -f drivers/kernelsu/Kconfig || { echo "::error::symlink drivers/kernelsu rusak"; exit 1; }
+          grep -n "kernelsu" drivers/Makefile drivers/Kconfig
 
-          F=KernelSU/kernel/kernel_includes.h
-          echo "=== include di kernel_includes.h ==="
-          grep -n "#include" "$F" | head -60 || true
+          K=KernelSU-Next/kernel
 
-          # 1. static_call.h hanya ada di kernel 5.10+
-          if grep -q "linux/static_call.h" "$F" && [ ! -f include/linux/static_call.h ]; then
-            sed -i 's|^\(\s*\)#\s*include <linux/static_call.h>|\1/* disabled for 5.4: linux/static_call.h */|' "$F"
+          # 1. linux/static_call.h hanya ada di kernel 5.10+
+          if [ ! -f include/linux/static_call.h ]; then
+            grep -rl "linux/static_call.h" "$K" | xargs -r sed -i -E 's|^([[:space:]]*)#[[:space:]]*include <linux/static_call.h>|\1/* disabled for 5.4: linux/static_call.h */|'
           fi
 
-          # 2. linux/hex.h tidak ada di kernel lama
+          # 2. linux/hex.h tidak ada di kernel 5.4
           if [ ! -f include/linux/hex.h ]; then
-            grep -rl "<linux/hex.h>" KernelSU/kernel | xargs -r sed -i 's|<linux/hex.h>|<linux/kernel.h>|'
+            grep -rl "<linux/hex.h>" "$K" | xargs -r sed -i 's|<linux/hex.h>|<linux/kernel.h>|'
           fi
 
-          # 3. makro fallthrough kalau belum ada
-          if ! grep -qs "define fallthrough" include/linux/compiler_attributes.h include/linux/compiler.h include/linux/compiler-clang.h; then
+          # 3. makro fallthrough (kernel Hana sudah punya; ini hanya jaga-jaga)
+          if ! grep -qs "define[[:space:]]\+fallthrough" include/linux/compiler_attributes.h include/linux/compiler.h include/linux/compiler-clang.h; then
+            F="$K/kernel_includes.h"
             last=$(grep -n '^#include' "$F" | tail -1 | cut -d: -f1)
             sed -i "${last}a #ifndef fallthrough\n#define fallthrough do {} while (0)\n#endif" "$F"
           fi
 
-          # 4. arch.h kadang tidak ikut ter-commit di branch builtin (SukiSU-Ultra PR #974)
-          if grep -rqE '#include "arch.h"' KernelSU/kernel && [ ! -f KernelSU/kernel/arch.h ]; then
-            curl -fsSL -o KernelSU/kernel/arch.h https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/include/arch.h \
+          # 4. arch.h: sudah ada di SukiSU (kernel/include/arch.h). Ambil dari luar hanya kalau memang hilang.
+          if ! find "$K" -name arch.h | grep -q .; then
+            curl -fsSL -o "$K/include/arch.h" https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/include/arch.h \
               || echo "::warning::gagal mengambil arch.h"
           fi
 
           # 5. cpu_spoof.c memakai clocksource->vdso_clock_mode (baru ada di kernel 5.10+).
-          #    Field int ditambah di AKHIR struct clocksource (offset field lain tidak berubah,
-          #    vDSO 5.4 tidak membacanya) sehingga cpu_spoof.c compile tanpa diubah.
+          #    Field int ditambah di AKHIR struct clocksource supaya offset field lain tidak bergeser.
           CLK=include/linux/clocksource.h
-          if grep -rq "vdso_clock_mode" KernelSU/kernel && ! grep -q "vdso_clock_mode" "$CLK"; then
-            echo "=== pemakaian vdso_clock_mode di SukiSU ==="
-            grep -rn "vdso_clock_mode" KernelSU/kernel || true
+          if grep -rq "vdso_clock_mode" "$K" && ! grep -q "vdso_clock_mode;" "$CLK"; then
             awk '
               /^struct clocksource[[:space:]]*\{/ { in_cs=1 }
               in_cs && /^\}.*;/ {
@@ -141,209 +117,221 @@ jobs:
               }
               { print }
             ' "$CLK" > "$CLK.new" && mv "$CLK.new" "$CLK"
-            if ! grep -q "int vdso_clock_mode;" "$CLK"; then
-              echo "::error::Gagal menyisipkan vdso_clock_mode ke struct clocksource ($CLK)"
-              grep -n -A40 "^struct clocksource" "$CLK" | head -80
-              exit 1
-            fi
-            echo "=== clocksource.h sesudah patch ==="
-            grep -n -B3 -A2 "vdso_clock_mode" "$CLK"
+            grep -q "int vdso_clock_mode;" "$CLK" || { echo "::error::gagal menyisipkan vdso_clock_mode"; exit 1; }
           fi
 
-          # 6. fungsi SUSFS dipanggil walau SUSFS tidak terpasang di source kernel
-          PO=KernelSU/kernel/manager/pkg_observer.c
-          if [ -f "$PO" ]; then
-            echo "=== konteks susfs di pkg_observer.c ==="
-            grep -n -B4 -A2 "susfs" "$PO" | head -60 || true
-            if grep -q "susfs_parse_priority_app_strings" "$PO" && ! grep -rq "susfs_parse_priority_app_strings" include/linux 2>/dev/null; then
-              line=$(grep -n '^#include' "$PO" | tail -1 | cut -d: -f1)
-              sed -i "${line}a #ifndef susfs_parse_priority_app_strings\n#define susfs_parse_priority_app_strings(...) (0)\n#endif" "$PO"
-              echo "stub susfs_parse_priority_app_strings dipasang"
-            fi
+          # 6. fungsi SUSFS dipanggil walau SUSFS tidak dipasang
+          PO="$K/manager/pkg_observer.c"
+          if [ -f "$PO" ] && grep -q "susfs_parse_priority_app_strings" "$PO"; then
+            line=$(grep -n '^#include' "$PO" | tail -1 | cut -d: -f1)
+            sed -i "${line}a #ifndef CONFIG_KSU_SUSFS\n#ifndef susfs_parse_priority_app_strings\n#define susfs_parse_priority_app_strings(...) (0)\n#endif\n#endif" "$PO"
           fi
 
-          # 7. opsional: samakan KERNEL_SU_UAPI_VERSION dengan manager/ksud (SukiSU-Ultra issue #996)
-          if [ -n "$KSU_UAPI" ]; then
-            if ! [[ "$KSU_UAPI" =~ ^[0-9]+$ ]]; then
-              echo "::error::uapi_version harus berupa angka"; exit 1
-            fi
-            H=KernelSU/kernel/include/uapi/supercall.h
-            [ -f "$H" ] || H=$(grep -rl "KERNEL_SU_UAPI_VERSION" KernelSU/kernel | head -1)
-            echo "=== UAPI sebelum ($H) ==="
-            grep -n "KERNEL_SU_UAPI_VERSION" "$H" || true
-            sed -i -E "s/(KERNEL_SU_UAPI_VERSION,[[:space:]]*)[0-9]+/\1${KSU_UAPI}/" "$H"
-            echo "=== UAPI sesudah ==="
-            grep -n "KERNEL_SU_UAPI_VERSION" "$H" || echo "::warning::pola KERNEL_SU_UAPI_VERSION tidak ditemukan, tidak ada yang diubah"
-          fi
+          # 7. matikan preinit SukiSU (butuh header userspace dan fitur kernel 5.3+)
+          sed -i -E 's|^([[:space:]]*KSU_UAPI_INC[[:space:]]*:?=[[:space:]]*).*$|\1$(objtree)/usr/include-ksu-disabled|' "$K/Makefile"
+          grep -n "KSU_UAPI_INC :=" "$K/Makefile" || echo "::warning::KSU_UAPI_INC tidak ditemukan"
 
-          # 8. preinit SukiSU (preinit/preinit.c + preinit/runner) butuh header userspace
-          #    ($(objtree)/usr/include dari headers_install) dan fitur kernel 5.3+ (struct clone_args).
-          #    Makefile SukiSU mematikannya sendiri bila direktori itu tidak ada. Kita paksa jalur itu
-          #    dengan mengarahkan KSU_UAPI_INC ke direktori yang tidak ada.
-          if [ "$NO_PREINIT" = "true" ]; then
-            echo "=== Makefile/Kbuild SukiSU terkait preinit (sebelum) ==="
-            grep -n -i "KSU_UAPI_INC\|KSU_NO_PREINIT\|preinit" KernelSU/kernel/Makefile KernelSU/kernel/Kbuild 2>/dev/null | head -60 || true
-            for mk in KernelSU/kernel/Makefile KernelSU/kernel/Kbuild; do
-              if [ -f "$mk" ]; then
-                sed -i -E 's|^([[:space:]]*KSU_UAPI_INC[[:space:]]*:?=[[:space:]]*).*$|\1$(objtree)/usr/include-ksu-disabled|' "$mk"
-              fi
-            done
-            echo "=== sesudah ==="
-            grep -n "KSU_UAPI_INC" KernelSU/kernel/Makefile KernelSU/kernel/Kbuild 2>/dev/null || true
-            if ! grep -qs "include-ksu-disabled" KernelSU/kernel/Makefile KernelSU/kernel/Kbuild; then
-              echo "::warning::KSU_UAPI_INC tidak ditemukan di Makefile/Kbuild SukiSU; preinit mungkin masih aktif. Cek bagian 'sebelum' di atas."
-            fi
-          fi
+      - name: Pasang hook manual SukiSU ke kernel (exec, faccessat, stat, read, input, reboot)
+        if: ${{ inputs.root == 'sukisu' }}
+        run: |
+          set -e
+          cat > "$RUNNER_TEMP/ksu_hooks.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          """Pasang hook manual SukiSU-Ultra (builtin) ke kernel 5.4 Hana.
+          Pemakaian: python3 ksu_hooks.py <root-kernel>
+          Setiap titik sisip dicari persis; kalau tidak ketemu, berhenti dengan pesan jelas."""
+          import sys, os
 
-          # 9. diagnostik hook
-          echo "=== Hook execve/sucompat di fs/exec.c ==="
-          grep -n "sucompat\|ksu_handle_execve" fs/exec.c || true
-          if grep -nE "sucompat[a-z_]*\([^)]*NULL,[[:space:]]*NULL,[[:space:]]*NULL" fs/exec.c >/dev/null 2>&1; then
-            echo "::warning::fs/exec.c memanggil sucompat dengan NULL,NULL,NULL. Driver builtin bisa NULL-deref saat execve pertama (boot panic). Pastikan hook meneruskan &argv, &envp."
-          fi
-          echo "=== Hook reboot di kernel/reboot.c ==="
-          grep -n "ksu_handle" kernel/reboot.c || echo "(tidak ada hook ksu di kernel/reboot.c)"
+          root = sys.argv[1]
+          MARK = "KSU manual hook"
 
-          echo "=== Cek simbol: dipakai hook di kernel vs ada di SukiSU ==="
-          for s in $(grep -ohE "ksu_[a-z0-9_]+" fs/exec.c fs/open.c fs/stat.c fs/read_write.c kernel/sys.c kernel/reboot.c drivers/input/input.c 2>/dev/null | sort -u); do
-            if grep -rqE "\b$s\b" KernelSU/kernel; then echo "OK       $s"; else echo "MISSING  $s"; fi
-          done
+
+          def load(rel):
+              with open(os.path.join(root, rel), "r", encoding="utf-8", errors="surrogateescape") as f:
+                  return f.read()
+
+
+          def save(rel, s):
+              with open(os.path.join(root, rel), "w", encoding="utf-8", errors="surrogateescape") as f:
+                  f.write(s)
+
+
+          def find(s, rel, anchor, start=0):
+              i = s.find(anchor, start)
+              if i < 0:
+                  sys.exit("::error::[hook] titik sisip tidak ditemukan di %s: %r" % (rel, anchor))
+              return i
+
+
+          def ins_before(s, i, text):
+              return s[:i] + text + s[i:]
+
+
+          def patch(rel, fn):
+              s = load(rel)
+              if MARK in s:
+                  print("[hook] %s sudah dipasang, dilewati" % rel)
+                  return
+              s = fn(s, rel)
+              save(rel, s)
+              print("[hook] OK  %s" % rel)
+
+
+          def wrap(code):
+              return "#ifdef CONFIG_KSU /* %s */\n%s#endif\n" % (MARK, code)
+
+
+          # ---------- fs/exec.c : execve / execveat (+ compat) lewat do_execveat_common ----------
+          def exec_c(s, rel):
+              a = find(s, rel, "static int do_execveat_common(int fd, struct filename *filename,")
+              s = ins_before(s, a, wrap(
+                  "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,\n"
+                  "\t\t\t       void *envp, int *flags);\n"))
+              r = find(s, rel, "\treturn __do_execve_file(fd, filename, argv, envp, flags, NULL);", a)
+              return ins_before(s, r, wrap(
+                  "\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"))
+
+
+          # ---------- fs/open.c : faccessat ----------
+          def open_c(s, rel):
+              a = find(s, rel, "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)")
+              b = find(s, rel, "{\n", a) + 2
+              s = s[:b] + wrap("\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n") + s[b:]
+              return ins_before(s, a, wrap(
+                  "extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n"
+                  "\t\t\t\tint *mode, int *__unused_flags);\n"))
+
+
+          # ---------- fs/read_write.c : read ----------
+          def read_c(s, rel):
+              a = find(s, rel, "SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)")
+              r = find(s, rel, "\treturn ksys_read(fd, buf, count);", a)
+              s = ins_before(s, r, wrap(
+                  "\tif (unlikely(ksu_vfs_read_hook))\n"
+                  "\t\tksu_handle_sys_read(fd, &buf, &count);\n"))
+              return ins_before(s, a, wrap(
+                  "extern bool ksu_vfs_read_hook __read_mostly;\n"
+                  "extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr,\n"
+                  "\t\t\t       size_t *count_ptr);\n"))
+
+
+          # ---------- fs/stat.c : newfstatat ----------
+          def stat_c(s, rel):
+              a = find(s, rel, "SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,")
+              r = find(s, rel, "\terror = vfs_fstatat(dfd, filename, &stat, flag);", a)
+              s = ins_before(s, r, wrap("\tksu_handle_stat(&dfd, &filename, &flag);\n"))
+              return ins_before(s, a, wrap(
+                  "extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n"))
+
+
+          # ---------- drivers/input/input.c : input_event ----------
+          def input_c(s, rel):
+              a = find(s, rel, "void input_event(struct input_dev *dev,")
+              k = "\tunsigned long flags;\n"
+              b = find(s, rel, k, a) + len(k)
+              s = s[:b] + wrap(
+                  "\tif (unlikely(ksu_input_hook))\n"
+                  "\t\tksu_handle_input_handle_event(&type, &code, &value);\n") + s[b:]
+              return ins_before(s, a, wrap(
+                  "extern bool ksu_input_hook __read_mostly;\n"
+                  "extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n"))
+
+
+          # ---------- kernel/reboot.c : reboot (jalur supercall / manager) ----------
+          def reboot_c(s, rel):
+              a = find(s, rel, "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,")
+              k = "\tint ret = 0;\n"
+              b = find(s, rel, k, a) + len(k)
+              s = s[:b] + wrap("\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n") + s[b:]
+              return ins_before(s, a, wrap(
+                  "extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n"))
+
+
+          patch("fs/exec.c", exec_c)
+          patch("fs/open.c", open_c)
+          patch("fs/read_write.c", read_c)
+          patch("fs/stat.c", stat_c)
+          patch("drivers/input/input.c", input_c)
+          patch("kernel/reboot.c", reboot_c)
+          print("[hook] semua hook terpasang")
+          PYEOF
+          cd kernel
+          python3 -I "$RUNNER_TEMP/ksu_hooks.py" "$PWD"
+          echo "=== hasil sisipan ==="
+          grep -rn "KSU manual hook" fs kernel drivers/input | head -40
 
       - name: Build kernel
         env:
           ROOT_MODE: ${{ inputs.root }}
-          HOOK_MODE: ${{ inputs.hook_mode }}
-          QUICK: ${{ inputs.quick_check }}
-          NO_PREINIT: ${{ inputs.disable_preinit }}
         run: |
           cd kernel
-          export TC="$GITHUB_WORKSPACE/tc/clang-r383902b/bin"
-          export PATH="$TC:$PATH"
-          export KROOT="$PWD"
-          export OUT_DIR="$PWD/out"
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          export REAL_CC=clang
-          export HOSTCC=gcc HOSTLD=ld HOSTAR=ar
-          export LD=ld.lld
-          export TARGET_BUILD_VARIANT=user
-          export ENABLE_MIUI_DEBUGGING=false
-          export DISABLE_WRAPPER=1
-          JOBS="$(nproc)"
-          export KBUILD_BUILD_USER="AETHERION"
-          export KBUILD_BUILD_HOST="aetherion"
-
-          KCFL="-fno-temp-file"
-          if [ "$ROOT_MODE" = "sukisu" ] && [ "$NO_PREINIT" = "true" ]; then
-            KCFL="$KCFL -DKSU_NO_PREINIT"
-            echo "preinit dimatikan (-DKSU_NO_PREINIT)"
-          fi
-
-          MAKE_TOOLS=(
-            CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy
-            OBJDUMP=llvm-objdump READELF=llvm-readelf STRIP=llvm-strip
-            HOSTCC=gcc HOSTLD=ld HOSTAR=ar
-            ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CLANG_TRIPLE=aarch64-linux-gnu-
-            "KCFLAGS=$KCFL"
+          OUT=out
+          MK=(
+            ARCH=arm64 CC=clang
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            LLVM_IAS=1 LLVM=1
+            O=$OUT
           )
-
-          # 1. pakai defconfig bawaan tree (jangan digenerate ulang kalau sudah ada)
-          DEF=arch/arm64/configs/vendor/renoir-qgki_defconfig
-          if [ ! -f "$DEF" ]; then
-            bash scripts/gki/generate_defconfig.sh vendor/renoir-qgki_defconfig
-          fi
-          echo "=== Opsi KMI/layout di defconfig bawaan ==="
-          grep -E "KMI_|PCIEAER|TASK_DELAY_ACCT|BLK_WBT|QTI_SCMI_PLH|SONY_FF|ZRAM_WRITEBACK" "$DEF" || echo "(tidak ada di defconfig)"
-          mkdir -p "$OUT_DIR"
-          cp "$DEF" "$OUT_DIR/.config"
-          make O="$OUT_DIR" "${MAKE_TOOLS[@]}" olddefconfig
-
-          # 2. atur root SukiSU (tanpa hook manual, tanpa SUSFS)
           if [ "$ROOT_MODE" = "sukisu" ]; then
-            ./scripts/config --file "$OUT_DIR/.config" -d KSU_MANUAL_HOOK -e KSU -d KSU_SUSFS
-            if [ "$HOOK_MODE" = "branchlink" ]; then
-              ./scripts/config --file "$OUT_DIR/.config" -d KSU_TAMPER_SYSCALL_TABLE -e KSU_HACK_ARM64_BRANCH_LINK
-            else
-              ./scripts/config --file "$OUT_DIR/.config" -d KSU_HACK_ARM64_BRANCH_LINK -e KSU_TAMPER_SYSCALL_TABLE
-            fi
+            MK+=("KCFLAGS=-DKSU_NO_PREINIT")
           fi
+          JOBS="$(nproc --all)"
 
-          # 3. opsi wajib agar modul vendor stock tetap bisa dimuat (lihat README tree)
-          REQ="KMI_CRC_BYPASS KMI_VENDOR_SHIM PCIEAER TASK_DELAY_ACCT BLK_WBT QTI_SCMI_PLH_PROTOCOL SONY_FF ZRAM_WRITEBACK"
-          for o in $REQ; do ./scripts/config --file "$OUT_DIR/.config" -e "$o"; done
-          # nama kernel (kata "qgki" harus tetap ada)
-          ./scripts/config --file "$OUT_DIR/.config" --set-str LOCALVERSION "-qgki-AETHERION-v0.1" -d LOCALVERSION_AUTO
-          make O="$OUT_DIR" "${MAKE_TOOLS[@]}" olddefconfig
+          # 1. config dasar milik Hana (sama dengan build resmi mereka)
+          make "${MK[@]}" vendor/renoir_defconfig
 
-          # vdso32 butuh assembler ARM32 yang tidak ada di runner
-          if grep -q "^CONFIG_COMPAT_VDSO=y" "$OUT_DIR/.config"; then
-            ./scripts/config --file "$OUT_DIR/.config" -d COMPAT_VDSO
-            make O="$OUT_DIR" "${MAKE_TOOLS[@]}" olddefconfig
-          fi
+          # 2. atur root
+          case "$ROOT_MODE" in
+            sukisu)
+              ./scripts/config --file $OUT/.config -e KSU -d KSU_DEBUG -d KSU_SUSFS -d KPM -d KSU_FEATURE_ADBROOT
+              ;;
+            none)
+              ./scripts/config --file $OUT/.config -d KSU
+              ;;
+            ksunext)
+              echo "Mode ksunext: pakai config Hana apa adanya"
+              ;;
+          esac
+          make "${MK[@]}" olddefconfig
 
           echo "=== Cek config penting ==="
-          grep -E "CONFIG_LTO_CLANG|CONFIG_CFI_CLANG|CONFIG_SHADOW_CALL_STACK|CONFIG_KSU|KMI_CRC_BYPASS|KMI_VENDOR_SHIM|CONFIG_LOCALVERSION" "$OUT_DIR/.config" || true
-          MISSING=""
-          for o in $REQ; do
-            grep -q "^CONFIG_$o=y" "$OUT_DIR/.config" || MISSING="$MISSING $o"
-          done
-          if [ -n "$MISSING" ]; then
-            echo "::error::Opsi wajib belum aktif di .config:$MISSING"
-            exit 1
-          fi
-          if ! grep -q "^CONFIG_LTO_CLANG=y" "$OUT_DIR/.config"; then
-            echo "::error::LTO_CLANG hilang dari .config (toolchain tidak terdeteksi benar). Berhenti."
-            exit 1
-          fi
-          if ! grep -q "^CONFIG_KSU=y" "$OUT_DIR/.config"; then
-            echo "::error::CONFIG_KSU tidak aktif di .config. Berhenti."
-            exit 1
-          fi
-          if [ "$ROOT_MODE" = "sukisu" ] && grep -q "^CONFIG_KSU_SUSFS=y" "$OUT_DIR/.config"; then
-            echo "::error::KSU_SUSFS masih aktif padahal source kernel tidak punya SUSFS. Berhenti."
-            exit 1
+          grep -E "^(# )?CONFIG_(KSU|KPM|KPROBES|LTO_CLANG|CFI_CLANG|LOCALVERSION|MODVERSIONS)[A-Z_]*[= ]" $OUT/.config || true
+          if [ "$ROOT_MODE" = "sukisu" ]; then
+            grep -q "^CONFIG_KSU=y" $OUT/.config || { echo "::error::CONFIG_KSU tidak aktif"; exit 1; }
+            if grep -q "^CONFIG_KSU_SUSFS=y" $OUT/.config; then echo "::error::KSU_SUSFS masih aktif (butuh patch SUSFS kernel)"; exit 1; fi
           fi
 
-          # 4. siapkan file yang dibuat otomatis (compile.h dan flask.h) sebelum driver root dikompilasi
-          if ! make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -j"$JOBS" prepare scripts > prep.log 2>&1; then
+          # 3. siapkan file otomatis (compile.h, flask.h) supaya driver bisa diperiksa sendirian
+          if ! make "${MK[@]}" -j"$JOBS" prepare scripts > prep.log 2>&1; then
             echo "prepare gagal:"; tail -n 40 prep.log; exit 1
           fi
-          make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -k -j"$JOBS" init/version.o security/selinux/ > gen.log 2>&1 || true
-          if [ ! -f "$OUT_DIR/include/generated/compile.h" ]; then
-            echo "::error::compile.h tidak terbentuk. 40 baris terakhir gen.log:"
-            tail -n 40 gen.log
-            exit 1
-          fi
-          if [ ! -f "$OUT_DIR/security/selinux/flask.h" ]; then
-            echo "::error::flask.h tidak terbentuk. 40 baris terakhir gen.log:"
+          make "${MK[@]}" -k -j"$JOBS" init/version.o security/selinux/ > gen.log 2>&1 || true
+          if [ ! -f $OUT/include/generated/compile.h ] || [ ! -f $OUT/security/selinux/flask.h ]; then
+            echo "::error::compile.h / flask.h tidak terbentuk. 40 baris terakhir gen.log:"
             tail -n 40 gen.log
             exit 1
           fi
 
-          # 5. PASS PERIKSA driver root: tampilkan SEMUA error drivers/kernelsu sekaligus (-k)
-          if [ -e drivers/kernelsu ]; then
+          # 4. periksa driver root dulu, tampilkan SEMUA error sekaligus
+          if [ "$ROOT_MODE" = "sukisu" ]; then
             echo "=== Kompilasi drivers/kernelsu (semua error sekaligus) ==="
-            make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -k -j"$JOBS" drivers/kernelsu/ > ksu.log 2>&1 || true
-            echo "=== Pesan Kbuild SukiSU ==="
-            grep -n "^-- \|preinit" ksu.log | head -30 || true
+            make "${MK[@]}" -k -j"$JOBS" drivers/kernelsu/ > ksu.log 2>&1 || true
+            grep -n "^-- " ksu.log | head -20 || true
             echo "===================== SEMUA ERROR drivers/kernelsu ====================="
             grep -nE "error:|fatal error|undefined" ksu.log | head -80 || true
             if grep -qE "error:|fatal error" ksu.log; then
-              echo "::error::Masih ada error di driver root (lihat daftar di atas)."
+              echo "::error::Masih ada error di driver SukiSU (lihat daftar di atas)."
               exit 1
             fi
             echo "drivers/kernelsu lolos kompilasi."
           fi
-          if [ "$QUICK" = "true" ]; then
-            echo "Mode cek cepat selesai. Jalankan lagi dengan quick_check = false untuk build penuh."
-            exit 0
-          fi
 
-          # 6. build penuh
-          if ! make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -j"$JOBS" Image > build.log 2>&1; then
-            echo "Build gagal. Ulang 1 thread untuk nampilin error asli..."
-            make O="$OUT_DIR" "${MAKE_TOOLS[@]}" -j1 Image > build-retry.log 2>&1 || true
+          # 5. build penuh
+          if ! make "${MK[@]}" -j"$JOBS" > build.log 2>&1; then
+            echo "Build gagal. Ulang 1 thread untuk menampilkan error asli..."
+            make "${MK[@]}" -j1 > build-retry.log 2>&1 || true
             echo "===================== BARIS ERROR ====================="
             grep -nE "error:|Error |\*\*\*|No rule|undefined|not found|fatal" build.log build-retry.log | head -40
             echo "================= 40 BARIS TERAKHIR ==================="
@@ -351,21 +339,47 @@ jobs:
             exit 1
           fi
 
-          mkdir -p "$GITHUB_WORKSPACE/result"
-          cp "$OUT_DIR/arch/arm64/boot/Image" "$GITHUB_WORKSPACE/result/"
-          cp "$OUT_DIR/.config" "$GITHUB_WORKSPACE/result/config.txt"
-          cp "$OUT_DIR/include/config/kernel.release" "$GITHUB_WORKSPACE/result/" || true
-          echo "root=$ROOT_MODE hook=$HOOK_MODE" > "$GITHUB_WORKSPACE/result/info.txt"
-          (cd "$GITHUB_WORKSPACE/result" && sha256sum Image > Image.sha256 && ls -la)
+          IMG=$OUT/arch/arm64/boot/Image
+          test -s "$IMG" || { echo "::error::Image tidak ada"; exit 1; }
+          file "$IMG"
+          file "$IMG" | grep -qi "ARM64" || { echo "::error::Image bukan ARM64"; exit 1; }
+          ls -la "$IMG"
+          cat $OUT/include/config/kernel.release
 
-      - name: Upload kernel
+          if [ "$ROOT_MODE" = "sukisu" ]; then
+            echo "=== cek hook SukiSU di kernel jadi ==="
+            n=$(llvm-nm $OUT/vmlinux 2>/dev/null | grep -c "ksu_handle_" || true)
+            echo "simbol ksu_handle_* di vmlinux: $n"
+            [ "$n" -gt 0 ] || echo "::warning::simbol ksu_handle_ tidak terlihat (bisa karena LTO meng-inline); cek log saat boot"
+          fi
+
+      - name: Bungkus ZIP AnyKernel3 (pakai template resmi Hana)
+        env:
+          ROOT_MODE: ${{ inputs.root }}
+        run: |
+          set -e
+          cd kernel
+          KVER=$(make -s kernelversion)
+          NAME="Hana-${ROOT_MODE}-renoir-$(date +%Y%m%d)-${KVER}"
+          rm -rf "$GITHUB_WORKSPACE/ak3"
+          cp -r scripts/ak3 "$GITHUB_WORKSPACE/ak3"
+          cp out/arch/arm64/boot/Image "$GITHUB_WORKSPACE/ak3/Image"
+          (cd "$GITHUB_WORKSPACE/ak3" && zip -q -r9 "$GITHUB_WORKSPACE/$NAME.zip" .)
+          mkdir -p "$GITHUB_WORKSPACE/result"
+          mv "$GITHUB_WORKSPACE/$NAME.zip" "$GITHUB_WORKSPACE/result/"
+          cp out/.config "$GITHUB_WORKSPACE/result/config.txt"
+          cp out/include/config/kernel.release "$GITHUB_WORKSPACE/result/" || true
+          (cd "$GITHUB_WORKSPACE/result" && sha256sum *.zip > zip.sha256 && ls -la)
+          unzip -l "$GITHUB_WORKSPACE/result/$NAME.zip" | head -30
+
+      - name: Upload hasil
         uses: actions/upload-artifact@v4
         with:
-          name: Renoir-Kernel-Image
+          name: Renoir-Hana-${{ inputs.root }}
           path: result/
-          if-no-files-found: ignore
+          if-no-files-found: error
 
-      - name: Upload build log
+      - name: Upload log build
         if: always()
         uses: actions/upload-artifact@v4
         with:
