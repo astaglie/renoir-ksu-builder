@@ -8,9 +8,9 @@ on:
         required: true
         default: "main"
       suki_ref:
-        description: "Branch SukiSU-Ultra (untuk cek API SUSFS yang dipanggil)"
+        description: "Commit/branch SukiSU-Ultra yang cocok dengan SUSFS sumber"
         required: true
-        default: "builtin"
+        default: "b1d534bc41941b2c818d7a1a1dac341e4aabfc2d"
       susfs_repo:
         description: "Repo sumber SUSFS yang sudah jalan dengan SukiSU di 5.4"
         required: true
@@ -585,7 +585,7 @@ jobs:
             echo "kernel    : $(make -C hana -s kernelversion 2>/dev/null)"
             echo "sumber    : ${{ inputs.susfs_repo }} @ $(git -C src rev-parse HEAD)"
             echo "dasar     : ${{ inputs.base_repo }} @ $(git -C base rev-parse HEAD)"
-            echo "sukisu    : branch ${{ inputs.suki_ref }} @ $(git -C suki rev-parse HEAD)"
+            echo "sukisu    : ${{ inputs.suki_ref }} @ $(git -C suki rev-parse HEAD)"
             echo "SUSFS     : $(grep -h 'define SUSFS_VERSION' hana/include/linux/susfs.h | cut -d' ' -f3)"
             echo "terapkan  : cd <root kernel> && patch -p1 --no-backup-if-mismatch < susfs-hana.patch"
           } > result/susfs-hana.info
