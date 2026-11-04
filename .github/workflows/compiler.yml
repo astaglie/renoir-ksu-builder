@@ -325,13 +325,17 @@ jobs:
 
           # patch KernelSU-nya (10_enable_susfs_for_ksu.patch) sengaja TIDAK dipasang:
           # itu untuk KernelSU upstream, sedangkan SukiSU punya integrasi SuSFS sendiri.
+          # buang file .rej bawaan repo Hana supaya yang tersisa pasti dari patch SuSFS
+          find . -name '*.rej' -delete
+
           patch -p1 --no-backup-if-mismatch < "$P" 2>&1 | tee -a "$LOG" || true
+          echo "=== ringkasan hunk gagal ===" | tee -a "$LOG"
+          grep -E "FAILED|rejects" "$LOG" || true
 
           if find . -name '*.rej' | grep -q .; then
-            echo "=== file reject ===" | tee -a "$LOG"
-            find . -name '*.rej' -print | tee -a "$LOG"
-            find . -name '*.rej' -exec sh -c 'echo "##### $1"; cat "$1"' _ {} \; > susfs-rej.log
-            echo "::error::Ada hunk SuSFS yang reject. Isi reject ada di artifact build-log (susfs-rej.log). Kirim bagian ini ke Claude."
+            echo "=== ISI FILE REJECT ==="
+            find . -name '*.rej' -exec sh -c 'echo "##### $1"; cat "$1"' _ {} \; | tee susfs-rej.log
+            echo "::error::Ada hunk SuSFS yang reject. Isi lengkapnya tercetak di log step ini (bagian ISI FILE REJECT)."
             exit 1
           fi
           echo "patch kernel SuSFS bersih (tanpa reject)" | tee -a "$LOG"
