@@ -304,6 +304,7 @@ jobs:
               os.remove(rej)
               print("[fixup] fs/proc/fd.c OK")
 
+
           # include/linux/mount.h: pakai slot KABI no.4 di struct vfsmount (ukuran struct tidak berubah)
           def fix_mount():
               p = "include/linux/mount.h"
@@ -324,8 +325,133 @@ jobs:
               os.remove(rej)
               print("[fixup] include/linux/mount.h OK")
 
+          def read(p):
+              return open(p, encoding="utf-8", errors="surrogateescape").read()
+
+          def write(p, s):
+              open(p, "w", encoding="utf-8", errors="surrogateescape").write(s)
+
+          # fs/namei.c: blok include + deklarasi di atas file (konteks Hana beda, jadi sisip setelah #include "mount.h")
+          def fix_namei():
+              p = "fs/namei.c"
+              rej = p + ".rej"
+              if not os.path.exists(rej):
+                  return
+              s = read(p)
+              if "KSU fixup namei" not in s:
+                  anchor = '#include "mount.h"\n'
+                  i = s.find(anchor)
+                  if i < 0:
+                      sys.exit('::error::fixup namei.c: #include "mount.h" tidak ditemukan')
+                  i += len(anchor)
+                  add = ("\n/* KSU fixup namei */\n"
+                         "#if defined(CONFIG_KSU_SUSFS_SUS_PATH) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n"
+                         "#include <linux/susfs.h>\n"
+                         "#endif\n\n"
+                         "#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n"
+                         "#ifndef EOPENREDIRECT\n#define EOPENREDIRECT 519\n#endif\n"
+                         "#endif\n\n"
+                         "#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n"
+                         "extern const struct qstr susfs_fake_qstr_name;\n"
+                         "#endif\n")
+                  s = s[:i] + add + s[i:]
+                  write(p, s)
+              os.remove(rej)
+              print("[fixup] fs/namei.c OK")
+
+          # kernel/sys.c: spoof uname di newuname
+          def fix_sys():
+              p = "kernel/sys.c"
+              rej = p + ".rej"
+              if not os.path.exists(rej):
+                  return
+              s = read(p)
+              if "susfs_spoof_uname(&tmp)" not in s:
+                  d = "SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)"
+                  i = s.find(d)
+                  if i < 0:
+                      sys.exit("::error::fixup sys.c: SYSCALL_DEFINE1(newuname ...) tidak ditemukan")
+                  m = "\tmemcpy(&tmp, utsname(), sizeof(tmp));\n"
+                  j = s.find(m, i)
+                  if j < 0 or j - i > 600:
+                      sys.exit("::error::fixup sys.c: memcpy(&tmp, utsname() ...) tidak ditemukan di newuname")
+                  j += len(m)
+                  s = s[:j] + "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n\tsusfs_spoof_uname(&tmp);\n#endif\n" + s[j:]
+                  if "extern void susfs_spoof_uname" not in s:
+                      s = (s[:i] + "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
+                           "extern void susfs_spoof_uname(struct new_utsname* tmp);\n#endif\n" + s[i:])
+                  write(p, s)
+              os.remove(rej)
+              print("[fixup] kernel/sys.c OK")
+
+          # security/selinux/avc.c: spoof log avc untuk sid KSU
+          def fix_avc():
+              p = "security/selinux/avc.c"
+              rej = p + ".rej"
+              if not os.path.exists(rej):
+                  return
+              s = read(p)
+              if "bypass_target_context" not in s:
+                  m = re.search(r'\trc = security_sid_to_context\([^;]*?sad->tsid,\s*&tcontext,\s*&tcontext_len\);\n', s)
+                  if not m:
+                      sys.exit("::error::fixup avc.c: security_sid_to_context(... sad->tsid ...) tidak ditemukan")
+                  blk = ("#ifdef CONFIG_KSU_SUSFS\n"
+                         "\tif (static_branch_likely(&susfs_is_avc_log_spoofing_enabled) &&\n"
+                         "\t    unlikely(sad->tsid == susfs_ksu_sid)) {\n"
+                         "\t\tif (rc)\n"
+                         "\t\t\taudit_log_format(ab, \" tsid=%d\", susfs_priv_app_sid);\n"
+                         "\t\telse\n"
+                         "\t\t\taudit_log_format(ab, \" tcontext=%s\",\n"
+                         "\t\t\t\t\t \"u:r:priv_app:s0:c512,c768\");\n"
+                         "\t\tgoto bypass_target_context;\n"
+                         "\t}\n"
+                         "#endif\n")
+                  s = s[:m.end()] + blk + s[m.end():]
+                  t = s.find("\ttclass = secclass_map[sad->tclass-1].name;\n", m.end())
+                  if t < 0:
+                      sys.exit("::error::fixup avc.c: baris tclass = secclass_map[...] tidak ditemukan")
+                  s = s[:t] + "#ifdef CONFIG_KSU_SUSFS\nbypass_target_context:\n#endif\n" + s[t:]
+                  write(p, s)
+              os.remove(rej)
+              print("[fixup] security/selinux/avc.c OK")
+
+          # fs/proc/task_mmu.c: sembunyikan vma sus_map di show_smaps_rollup (semua pemanggilan smap_gather_stats)
+          def fix_taskmmu():
+              p = "fs/proc/task_mmu.c"
+              rej = p + ".rej"
+              if not os.path.exists(rej):
+                  return
+              s = read(p)
+              i = s.find("static int show_smaps_rollup(struct seq_file *m, void *v)")
+              if i < 0:
+                  sys.exit("::error::fixup task_mmu.c: show_smaps_rollup tidak ditemukan")
+              j = s.find("\n}\n", i)
+              if j < 0:
+                  sys.exit("::error::fixup task_mmu.c: akhir show_smaps_rollup tidak ditemukan")
+              body = s[i:j]
+              pat = re.compile(r'^(\t+)(smap_gather_stats\(vma, [^;]*\);)', re.M)
+              changed = [0]
+              def rep(m):
+                  if "susfs_is_vma_sus_map" in body[max(0, m.start() - 120):m.start()]:
+                      return m.group(0)
+                  changed[0] += 1
+                  ind = m.group(1)
+                  return ("#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n%sif (!susfs_is_vma_sus_map(vma))\n#endif\n%s\t%s"
+                          % (ind, ind, m.group(2)))
+              nb = pat.sub(rep, body)
+              if changed[0] == 0 and "susfs_is_vma_sus_map" not in body:
+                  sys.exit("::error::fixup task_mmu.c: pemanggilan smap_gather_stats(vma, ...) tidak ditemukan")
+              s = s[:i] + nb + s[j:]
+              write(p, s)
+              os.remove(rej)
+              print("[fixup] fs/proc/task_mmu.c OK (%d pemanggilan)" % changed[0])
+
           fix_fd()
           fix_mount()
+          fix_namei()
+          fix_sys()
+          fix_avc()
+          fix_taskmmu()
           PYEOF
           python3 -I "$RUNNER_TEMP/fixups.py"
 
