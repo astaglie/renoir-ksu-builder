@@ -500,36 +500,75 @@ jobs:
           cd hana
           SK="$GITHUB_WORKSPACE/suki/kernel"
 
+          # Fungsi dianggap ADA kalau didefinisikan di SUSFS kernel (Hana) ATAU di source .c SukiSU sendiri
+          # (mis. susfs_set_sid / susfs_is_current_zygote_domain didefinisikan di drivers/kernelsu/selinux/selinux.c)
+          in_susfs() { grep -qw "$1" fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; }
+          in_suki_def() {
+            grep -rhE "^[A-Za-z_][^;(]*[ *]$1\(" "$SK" --include=*.c 2>/dev/null | grep -qvE '^extern ' 
+          }
+          have() { in_susfs "$1" || in_suki_def "$1"; }
+
+          add_decl() {
+            python3 - "$1" <<'PY'
+          import sys
+          p = "include/linux/susfs.h"
+          s = open(p).read()
+          i = s.rfind("#endif")
+          s = s[:i] + sys.argv[1] + "\n" + s[i:]
+          open(p, "w").write(s)
+          PY
+          }
+
           # Fungsi SUSFS yang dipanggil SukiSU tapi tidak ada di SUSFS lama
-          if ! grep -qw susfs_parse_priority_app_strings fs/susfs.c include/linux/susfs.h; then
+          if ! have susfs_parse_priority_app_strings; then
             echo "tambah stub susfs_parse_priority_app_strings"
             cat >> fs/susfs.c <<'EOF'
 
           /* stub kompatibilitas (workflow): SukiSU memanggil ini; filter prioritas tidak aktif */
           void susfs_parse_priority_app_strings(void) { }
           EOF
-            python3 - <<'PY'
-          p = "include/linux/susfs.h"
-          s = open(p).read()
-          i = s.rfind("#endif")
-          s = s[:i] + "void susfs_parse_priority_app_strings(void);\n" + s[i:]
-          open(p, "w").write(s)
-          PY
+            add_decl "void susfs_parse_priority_app_strings(void);"
           fi
-          if ! grep -qw susfs_set_priority_uid_filter fs/susfs.c include/linux/susfs.h; then
+          if ! have susfs_set_priority_uid_filter; then
             echo "tambah stub susfs_set_priority_uid_filter"
             cat >> fs/susfs.c <<'EOF'
 
           /* stub kompatibilitas (workflow): filter prioritas tidak aktif */
           void susfs_set_priority_uid_filter(void __user **user_info) { }
           EOF
-            python3 - <<'PY'
-          p = "include/linux/susfs.h"
-          s = open(p).read()
-          i = s.rfind("#endif")
-          s = s[:i] + "void susfs_set_priority_uid_filter(void __user **user_info);\n" + s[i:]
-          open(p, "w").write(s)
-          PY
+            add_decl "void susfs_set_priority_uid_filter(void __user **user_info);"
+          fi
+          # helper string standar SUSFS (implementasi sama dengan SUSFS upstream)
+          if ! have susfs_starts_with; then
+            echo "tambah susfs_starts_with"
+            cat >> fs/susfs.c <<'EOF'
+
+          bool susfs_starts_with(const char *str, const char *prefix)
+          {
+                  while (*prefix) {
+                          if (*str++ != *prefix++)
+                                  return false;
+                  }
+                  return true;
+          }
+          EOF
+            add_decl "bool susfs_starts_with(const char *str, const char *prefix);"
+          fi
+          if ! have susfs_ends_with; then
+            echo "tambah susfs_ends_with"
+            cat >> fs/susfs.c <<'EOF'
+
+          bool susfs_ends_with(const char *str, const char *suffix)
+          {
+                  size_t str_len = strlen(str);
+                  size_t suffix_len = strlen(suffix);
+
+                  if (suffix_len > str_len)
+                          return false;
+                  return !strcmp(str + str_len - suffix_len, suffix);
+          }
+          EOF
+            add_decl "bool susfs_ends_with(const char *str, const char *suffix);"
           fi
           if ! grep -qw CMD_SUSFS_SET_PRIORITY_UID_FILTER include/linux/susfs_def.h; then
             echo "tambah define CMD_SUSFS_SET_PRIORITY_UID_FILTER"
@@ -546,7 +585,9 @@ jobs:
           echo "=== cek semua fungsi susfs_* yang dipanggil SukiSU ==="
           miss=0
           for f in $(grep -rhoE '\bsusfs_[a-z0-9_]+\(' "$SK" | tr -d '(' | sort -u); do
-            if ! grep -qw "$f" fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; then
+            if have "$f"; then
+              echo "ok   $f"
+            else
               echo "::error::fungsi hilang: $f"; miss=1
             fi
           done
