@@ -1,8 +1,8 @@
-name: Renoir MIUI 14 - Kernel Hana + SukiSU Ultra
+name: Renoir MIUI 14 - Kernel Hana + SukiSU Ultra (+SuSFS)
 
 # Dasar kernel: Hana-kernel (ponces/android_kernel_xiaomi_sm8350-miui, Linux 5.4.283).
-# Kernel Hana versi rilis sudah kamu uji dan bisa boot di MIUI 14-mu.
-# Workflow ini mengganti KernelSU-Next bawaannya dengan SukiSU Ultra (builtin).
+# Workflow ini mengganti KernelSU-Next bawaannya dengan SukiSU Ultra (builtin),
+# lalu (opsional) menambahkan patch SuSFS sisi kernel.
 
 on:
   workflow_dispatch:
@@ -21,9 +21,28 @@ on:
         required: true
         default: "main"
       suki_ref:
-        description: "Branch SukiSU-Ultra (hanya kalau root = sukisu)"
+        description: "Branch SukiSU-Ultra (hanya kalau root = sukisu). Coba susfs-main kalau Kconfig builtin tidak punya KSU_SUSFS"
         required: true
         default: "builtin"
+      susfs:
+        description: "Pasang patch SuSFS (hanya kalau root = sukisu)"
+        required: true
+        type: boolean
+        default: true
+      susfs_ref:
+        description: "Branch/tag susfs4ksu (lihat daftar branch di log kalau gagal)"
+        required: true
+        default: "kernel-5.4"
+      kpm:
+        description: "Coba aktifkan KPM (eksperimen, belum tentu jalan)"
+        required: true
+        type: boolean
+        default: false
+      adbroot:
+        description: "Coba aktifkan ADB Root (eksperimen, bisa gagal compile di 5.4)"
+        required: true
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -81,6 +100,9 @@ jobs:
 
           K=KernelSU-Next/kernel
 
+          echo "=== opsi config KSU/KPM/SUSFS di Kconfig SukiSU ==="
+          grep -nE "^[[:space:]]*config (KSU|KPM)" "$K/Kconfig" || true
+
           # 1. linux/static_call.h hanya ada di kernel 5.10+
           if [ ! -f include/linux/static_call.h ]; then
             grep -rl "linux/static_call.h" "$K" | xargs -r sed -i -E 's|^([[:space:]]*)#[[:space:]]*include <linux/static_call.h>|\1/* disabled for 5.4: linux/static_call.h */|'
@@ -106,6 +128,7 @@ jobs:
 
           # 5. cpu_spoof.c memakai clocksource->vdso_clock_mode (baru ada di kernel 5.10+).
           #    Field int ditambah di AKHIR struct clocksource supaya offset field lain tidak bergeser.
+          #    Catatan: ini cuma supaya compile lolos; vDSO kernel 5.4 tidak membaca field ini.
           CLK=include/linux/clocksource.h
           if grep -rq "vdso_clock_mode" "$K" && ! grep -q "vdso_clock_mode;" "$CLK"; then
             awk '
@@ -260,9 +283,69 @@ jobs:
           echo "=== hasil sisipan ==="
           grep -rn "KSU manual hook" fs kernel drivers/input | head -40
 
+      - name: Pasang patch SuSFS (sisi kernel)
+        if: ${{ inputs.root == 'sukisu' && inputs.susfs }}
+        env:
+          SUSFS_REF: ${{ inputs.susfs_ref }}
+        run: |
+          set -e
+          cd kernel
+          LOG="$PWD/susfs-patch.log"
+          : > "$LOG"
+          S="$RUNNER_TEMP/susfs"
+
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git "$S"
+          {
+            echo "=== branch remote susfs4ksu ==="
+            git -C "$S" branch -r
+            echo "=== 10 tag terbaru ==="
+            git -C "$S" tag --sort=-creatordate | head -10
+          } | tee -a "$LOG"
+
+          git -C "$S" checkout "$SUSFS_REF" || { echo "::error::branch/tag '$SUSFS_REF' tidak ada. Lihat daftar branch/tag di atas, lalu isi input susfs_ref."; exit 1; }
+          git -C "$S" log -1 --oneline | tee -a "$LOG"
+          echo "=== isi kernel_patches ===" | tee -a "$LOG"
+          ls -R "$S/kernel_patches" | head -60 | tee -a "$LOG"
+
+          # file baru (fs/susfs.c dsb) dan header
+          if [ -d "$S/kernel_patches/fs" ]; then
+            cp -r "$S"/kernel_patches/fs/* fs/
+          fi
+          if [ -d "$S/kernel_patches/include/linux" ]; then
+            cp -r "$S"/kernel_patches/include/linux/* include/linux/
+          fi
+
+          # pilih patch kernel: utamakan yang namanya mengandung 5.4
+          P=$(ls "$S"/kernel_patches/50_add_susfs_in_kernel-*5.4*.patch 2>/dev/null | head -1 || true)
+          if [ -z "$P" ]; then
+            P=$(ls "$S"/kernel_patches/50_add_susfs_in_kernel-*.patch 2>/dev/null | head -1 || true)
+          fi
+          [ -n "$P" ] || { echo "::error::50_add_susfs_in_kernel-*.patch tidak ditemukan di $SUSFS_REF"; exit 1; }
+          echo "patch dipakai: $P" | tee -a "$LOG"
+
+          # patch KernelSU-nya (10_enable_susfs_for_ksu.patch) sengaja TIDAK dipasang:
+          # itu untuk KernelSU upstream, sedangkan SukiSU punya integrasi SuSFS sendiri.
+          patch -p1 --no-backup-if-mismatch < "$P" 2>&1 | tee -a "$LOG" || true
+
+          if find . -name '*.rej' | grep -q .; then
+            echo "=== file reject ===" | tee -a "$LOG"
+            find . -name '*.rej' -print | tee -a "$LOG"
+            find . -name '*.rej' -exec sh -c 'echo "##### $1"; cat "$1"' _ {} \; > susfs-rej.log
+            echo "::error::Ada hunk SuSFS yang reject. Isi reject ada di artifact build-log (susfs-rej.log). Kirim bagian ini ke Claude."
+            exit 1
+          fi
+          echo "patch kernel SuSFS bersih (tanpa reject)" | tee -a "$LOG"
+
+          echo "=== opsi SUSFS di Kconfig SukiSU ===" | tee -a "$LOG"
+          grep -n "config KSU_SUSFS" KernelSU-Next/kernel/Kconfig | tee -a "$LOG" \
+            || echo "::warning::Kconfig SukiSU tidak punya opsi KSU_SUSFS. Coba suki_ref=susfs-main."
+
       - name: Build kernel
         env:
           ROOT_MODE: ${{ inputs.root }}
+          USE_SUSFS: ${{ inputs.susfs }}
+          USE_KPM: ${{ inputs.kpm }}
+          USE_ADBROOT: ${{ inputs.adbroot }}
         run: |
           cd kernel
           OUT=out
@@ -285,7 +368,30 @@ jobs:
           # 2. atur root
           case "$ROOT_MODE" in
             sukisu)
-              ./scripts/config --file $OUT/.config -e KSU -d KSU_DEBUG -d KSU_SUSFS -d KPM -d KSU_FEATURE_ADBROOT
+              ./scripts/config --file $OUT/.config -e KSU -d KSU_DEBUG
+
+              if [ "$USE_SUSFS" = "true" ]; then
+                # sub-opsi SUSFS dibiarkan ikut default Kconfig, hasilnya dicetak di bawah
+                ./scripts/config --file $OUT/.config -e KSU_SUSFS
+                # SUS_SU tidak didukung di non-GKI (pakai hook manual)
+                if grep -q "config KSU_SUSFS_SUS_SU" KernelSU-Next/kernel/Kconfig 2>/dev/null; then
+                  ./scripts/config --file $OUT/.config -d KSU_SUSFS_SUS_SU
+                fi
+              else
+                ./scripts/config --file $OUT/.config -d KSU_SUSFS
+              fi
+
+              if [ "$USE_KPM" = "true" ]; then
+                ./scripts/config --file $OUT/.config -e KPM -e KALLSYMS -e KALLSYMS_ALL
+              else
+                ./scripts/config --file $OUT/.config -d KPM
+              fi
+
+              if [ "$USE_ADBROOT" = "true" ]; then
+                ./scripts/config --file $OUT/.config -e KSU_FEATURE_ADBROOT
+              else
+                ./scripts/config --file $OUT/.config -d KSU_FEATURE_ADBROOT
+              fi
               ;;
             none)
               ./scripts/config --file $OUT/.config -d KSU
@@ -297,10 +403,20 @@ jobs:
           make "${MK[@]}" olddefconfig
 
           echo "=== Cek config penting ==="
-          grep -E "^(# )?CONFIG_(KSU|KPM|KPROBES|LTO_CLANG|CFI_CLANG|LOCALVERSION|MODVERSIONS)[A-Z_]*[= ]" $OUT/.config || true
+          grep -E "^(# )?CONFIG_(KSU|KPM|KALLSYMS|KPROBES|LTO_CLANG|CFI_CLANG|LOCALVERSION|MODVERSIONS)[A-Z_]*[= ]" $OUT/.config || true
           if [ "$ROOT_MODE" = "sukisu" ]; then
             grep -q "^CONFIG_KSU=y" $OUT/.config || { echo "::error::CONFIG_KSU tidak aktif"; exit 1; }
-            if grep -q "^CONFIG_KSU_SUSFS=y" $OUT/.config; then echo "::error::KSU_SUSFS masih aktif (butuh patch SUSFS kernel)"; exit 1; fi
+            if [ "$USE_SUSFS" = "true" ]; then
+              grep -q "^CONFIG_KSU_SUSFS=y" $OUT/.config || { echo "::error::CONFIG_KSU_SUSFS tidak aktif setelah olddefconfig. Kemungkinan Kconfig SukiSU di branch ini tidak punya opsi SUSFS (coba suki_ref=susfs-main)."; exit 1; }
+            else
+              if grep -q "^CONFIG_KSU_SUSFS=y" $OUT/.config; then echo "::error::KSU_SUSFS masih aktif padahal input susfs=false"; exit 1; fi
+            fi
+            if [ "$USE_KPM" = "true" ]; then
+              grep -q "^CONFIG_KPM=y" $OUT/.config || echo "::warning::KPM diminta tapi tidak aktif di .config"
+            fi
+            if [ "$USE_ADBROOT" = "true" ]; then
+              grep -q "^CONFIG_KSU_FEATURE_ADBROOT=y" $OUT/.config || echo "::warning::ADB Root diminta tapi tidak aktif di .config"
+            fi
           fi
 
           # 3. siapkan file otomatis (compile.h, flask.h) supaya driver bisa diperiksa sendirian
@@ -351,16 +467,26 @@ jobs:
             n=$(llvm-nm $OUT/vmlinux 2>/dev/null | grep -c "ksu_handle_" || true)
             echo "simbol ksu_handle_* di vmlinux: $n"
             [ "$n" -gt 0 ] || echo "::warning::simbol ksu_handle_ tidak terlihat (bisa karena LTO meng-inline); cek log saat boot"
+            if [ "$USE_SUSFS" = "true" ]; then
+              n2=$(llvm-nm $OUT/vmlinux 2>/dev/null | grep -c "susfs_" || true)
+              echo "simbol susfs_* di vmlinux: $n2"
+              [ "$n2" -gt 0 ] || echo "::warning::simbol susfs_ tidak terlihat di vmlinux (bisa karena LTO); cek di manager setelah boot"
+            fi
           fi
 
       - name: Bungkus ZIP AnyKernel3 (pakai template resmi Hana)
         env:
           ROOT_MODE: ${{ inputs.root }}
+          USE_SUSFS: ${{ inputs.susfs }}
         run: |
           set -e
           cd kernel
           KVER=$(make -s kernelversion)
-          NAME="Hana-${ROOT_MODE}-renoir-$(date +%Y%m%d)-${KVER}"
+          TAG="$ROOT_MODE"
+          if [ "$ROOT_MODE" = "sukisu" ] && [ "$USE_SUSFS" = "true" ]; then
+            TAG="sukisu-susfs"
+          fi
+          NAME="Hana-${TAG}-renoir-$(date +%Y%m%d)-${KVER}"
           rm -rf "$GITHUB_WORKSPACE/ak3"
           cp -r scripts/ak3 "$GITHUB_WORKSPACE/ak3"
           cp out/arch/arm64/boot/Image "$GITHUB_WORKSPACE/ak3/Image"
