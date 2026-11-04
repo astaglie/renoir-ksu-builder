@@ -1,54 +1,5 @@
 name: Build SUSFS patch (Hana renoir 5.4)
 
-# Simpan file ini sebagai .github/workflows/build-susfs.yml di repo yang sama
-# dengan workflow kernelmu.
-#
-# Cara kerja:
-#   1. Ambil source SUSFS yang sudah terbukti jalan bersama SukiSU di kernel 5.4
-#      (default: WiteTanuki/W200DS-SukiSU-Kernel) dan source dasarnya (ZTE).
-#   2. Selisih keduanya, hanya bagian SUSFS/KSU, jadi patch.
-#   3. Patch dicoba ke kernel Hana + dicek terhadap API yang dipanggil SukiSU.
-#   4. Kalau bersih, patch dipublikasikan di release "susfs-hana-latest".
-#
-# Kalau nanti ada update: jalankan workflow ini lagi, lalu jalankan workflow kernel.
-#
-# ---------------------------------------------------------------------------
-# EDIT YANG PERLU DI WORKFLOW KERNELMU (supaya otomatis mengambil patch ini)
-# ---------------------------------------------------------------------------
-# 1) Tambah input baru di workflow_dispatch.inputs:
-#      susfs:
-#        description: "Pasang SUSFS (dari release susfs-hana-latest)"
-#        required: true
-#        type: boolean
-#        default: true
-#
-# 2) Step "Pasang hook manual SukiSU ..." ganti kondisinya jadi:
-#      if: ${{ inputs.root == 'sukisu' && !inputs.susfs }}
-#    (patch SUSFS membawa hook inline sendiri, jadi tidak boleh dobel)
-#
-# 3) Tambah step ini SETELAH step "Ganti KernelSU-Next dengan SukiSU Ultra ...":
-#      - name: Pasang patch SUSFS
-#        if: ${{ inputs.root == 'sukisu' && inputs.susfs }}
-#        env:
-#          GH_TOKEN: ${{ github.token }}
-#        run: |
-#          set -e
-#          gh release download susfs-hana-latest --repo "$GITHUB_REPOSITORY" \
-#            -p susfs-hana.patch -D "$RUNNER_TEMP" --clobber
-#          cd kernel
-#          patch -p1 --no-backup-if-mismatch < "$RUNNER_TEMP/susfs-hana.patch"
-#          if find . -name '*.rej' | grep -q .; then
-#            find . -name '*.rej'; echo "::error::patch SUSFS ada hunk gagal"; exit 1
-#          fi
-#
-# 4) Di step "Build kernel", bagian atur root untuk sukisu:
-#      ganti  -d KSU_SUSFS  menjadi:
-#        if [ "${{ inputs.susfs }}" = "true" ]; then SUS=-e; else SUS=-d; fi
-#        ./scripts/config --file $OUT/.config -e KSU -d KSU_DEBUG $SUS KSU_SUSFS -d KPM -d KSU_FEATURE_ADBROOT
-#      dan hapus/ubah baris pemeriksaan "KSU_SUSFS masih aktif" supaya hanya
-#      berlaku kalau inputs.susfs = false.
-# ---------------------------------------------------------------------------
-
 on:
   workflow_dispatch:
     inputs:
@@ -147,14 +98,16 @@ jobs:
           cat > "$RUNNER_TEMP/mkpatch.py" <<'PYEOF'
           #!/usr/bin/env python3
           """Selisih src vs base, hanya hunk yang menyentuh SUSFS/KSU.
-          Pemakaian: mkpatch.py <src> <base> <output.patch>"""
+          Pemakaian: mkpatch.py <src> <base> <output.patch> <hana>"""
           import os, re, subprocess, sys
 
-          src, base, outpath = sys.argv[1:4]
+          src, base, outpath, hana = sys.argv[1:5]
           KEY = re.compile(r"susfs|ksu|sus_su", re.I)
           EXCL_PREFIX = ("drivers/kernelsu/", "Documentation/", "tools/", "scripts/")
           # Hana sudah punya baris source/obj untuk drivers/kernelsu lewat symlink
           EXCL_FILES = {"drivers/Kconfig", "drivers/Makefile"}
+          # dari drivers/ hanya hook input yang dipakai SUSFS (sisanya driver vendor, bukan urusan SUSFS)
+          ALLOW_DRIVERS = {"drivers/input/input.c"}
           DIRS = ["fs", "include", "kernel", "mm", "security", "drivers",
                   "init", "net", "ipc", "lib", "block", "crypto"]
           HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
@@ -164,7 +117,8 @@ jobs:
                  "--include=Kconfig*", "--include=*.Kconfig"] + DIRS
           r = subprocess.run(cmd, cwd=src, capture_output=True)
           cands = sorted(f for f in r.stdout.decode("utf-8", "surrogateescape").split("\n")
-                         if f and not f.startswith(EXCL_PREFIX) and f not in EXCL_FILES)
+                         if f and not f.startswith(EXCL_PREFIX) and f not in EXCL_FILES
+                         and (not f.startswith("drivers/") or f in ALLOW_DRIVERS))
 
           out = []
           total_files = total_hunks = 0
@@ -174,6 +128,9 @@ jobs:
               if os.path.islink(s) or not os.path.isfile(s):
                   continue
               new = not os.path.exists(b)
+              if not new and not os.path.exists(os.path.join(hana, rel)):
+                  print("%-48s dilewati (tidak ada di Hana)" % rel)
+                  continue
               if new:
                   cmd = ["diff", "-u", "-L", "/dev/null", "-L", "b/" + rel, "/dev/null", s]
               else:
@@ -238,7 +195,7 @@ jobs:
           if total_files == 0:
               sys.exit("::error::patch kosong, sumber SUSFS tidak berisi hunk yang cocok")
           PYEOF
-          python3 -I "$RUNNER_TEMP/mkpatch.py" src base result/raw.patch
+          python3 -I "$RUNNER_TEMP/mkpatch.py" src base result/raw.patch hana
           ls -la result/raw.patch
 
       - name: Terapkan ke Hana
@@ -246,9 +203,108 @@ jobs:
         run: |
           cd hana
           set +e
-          patch -p1 --no-backup-if-mismatch -F3 < ../result/raw.patch | tee ../result/apply.log
+          # fuzz 2 (bawaan): fuzz 3 bisa menempel di tempat yang salah tanpa ketahuan
+          patch -p1 --batch --no-backup-if-mismatch -F2 < ../result/raw.patch | tee ../result/apply.log
           rc=${PIPESTATUS[0]}
           set -e
+          echo "patch exit code: $rc"
+          grep -E "with fuzz|FAILED|Skipping|ignored" ../result/apply.log || true
+
+          # --- perbaikan khusus Hana (hunk yang tidak cocok dengan source Hana) ---
+          cat > "$RUNNER_TEMP/fixups.py" <<'PYEOF'
+          import os, re, sys
+
+          def tabify(block):
+              out = []
+              for l in block.split("\n"):
+                  n = len(l) - len(l.lstrip(" "))
+                  out.append("\t" * (n // 4) + " " * (n % 4) + l.lstrip(" "))
+              return "\n".join(out)
+
+          # fs/proc/fd.c: Hana lama belum punya baris "ino:" di fdinfo, jadi hunk #3 meleset.
+          FD_BLOCK = r"""#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+              if (SUSFS_IS_INODE_OPEN_REDIRECT(file_inode(file)) &&
+                  !susfs_open_redirect_spoof_seq_show(file_inode(file),
+                                                      &spoofed_mnt_id, &spoofed_ino)) {
+                  seq_printf(m, "pos:\t%lli\nflags:\t0%o\nmnt_id:\t%i\nino:\t%lu\n",
+                             (long long)file->f_pos, f_flags,
+                             spoofed_mnt_id, spoofed_ino);
+                  goto bypass_orig_flow;
+              }
+          #endif
+
+          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+              mnt = real_mount(file->f_path.mnt);
+              if (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) &&
+                  mnt->mnt_id >= DEFAULT_SUS_MNT_ID) {
+                  struct path path;
+                  char *pathname = kmalloc(PAGE_SIZE, GFP_KERNEL);
+                  char *dpath;
+
+                  for (; mnt->mnt_id >= DEFAULT_SUS_MNT_ID; mnt = mnt->mnt_parent) { }
+
+                  if (!pathname) {
+                      goto out_seq_printf;
+                  }
+                  dpath = d_path(&file->f_path, pathname, PAGE_SIZE);
+                  if (!dpath) {
+                      goto out_free_pathname;
+                  }
+                  if (kern_path(dpath, 0, &path)) {
+                      goto out_free_pathname;
+                  }
+                  seq_printf(m, "pos:\t%lli\nflags:\t0%o\nmnt_id:\t%i\nino:\t%lu\n",
+                             (long long)file->f_pos, f_flags,
+                             mnt->mnt_id,
+                             path.dentry->d_inode->i_ino);
+                  path_put(&path);
+                  kfree(pathname);
+                  goto bypass_orig_flow;
+          out_free_pathname:
+                  kfree(pathname);
+              }
+          out_seq_printf:
+              seq_printf(m, "pos:\t%lli\nflags:\t0%o\nmnt_id:\t%i\nino:\t%lu\n",
+                         (long long)file->f_pos, f_flags,
+                         mnt->mnt_id,
+                         file_inode(file)->i_ino);
+          #else
+              seq_printf(m, "pos:\t%lli\nflags:\t0%o\nmnt_id:\t%i\nino:\t%lu\n",
+                         (long long)file->f_pos, f_flags,
+                         real_mount(file->f_path.mnt)->mnt_id,
+                         file_inode(file)->i_ino);
+          #endif
+
+          #if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
+          bypass_orig_flow:
+          #endif
+              show_fd_locks(m, file, files);
+          """
+
+          def fix_fd():
+              p = "fs/proc/fd.c"
+              rej = p + ".rej"
+              if not os.path.exists(rej):
+                  return
+              s = open(p, encoding="utf-8", errors="surrogateescape").read()
+              pat = re.compile(
+                  r'\tseq_printf\(m, "pos:\\t%lli\\nflags:\\t0%o\\nmnt_id:\\t%i\\n",\n'
+                  r'\s+\(long long\)file->f_pos, f_flags,\n'
+                  r'\s+real_mount\(file->f_path\.mnt\)->mnt_id\);\n\n'
+                  r'\tshow_fd_locks\(m, file, files\);\n')
+              m = pat.search(s)
+              if not m:
+                  sys.exit("::error::fixup fd.c: bagian seq_printf asli tidak ditemukan di Hana")
+              s = s[:m.start()] + tabify(FD_BLOCK) + s[m.end():]
+              open(p, "w", encoding="utf-8", errors="surrogateescape").write(s)
+              os.remove(rej)
+              print("[fixup] fs/proc/fd.c OK")
+
+          fix_fd()
+          PYEOF
+          python3 -I "$RUNNER_TEMP/fixups.py"
+
+          # --- laporan hunk yang masih gagal ---
           mkdir -p ../result/rejects
           find . -name '*.rej' -not -path './.git/*' | while read -r f; do
             mkdir -p "../result/rejects/$(dirname "$f")"
@@ -256,11 +312,14 @@ jobs:
           done
           n=$(find . -name '*.rej' -not -path './.git/*' | wc -l)
           echo "rejects=$n" >> "$GITHUB_OUTPUT"
-          echo "patch exit code: $rc, file .rej: $n"
+          echo "file .rej tersisa: $n"
           if [ "$n" -gt 0 ]; then
-            echo "===== hunk yang gagal ====="
-            find . -name '*.rej' -not -path './.git/*'
-            echo "::error::$n file punya hunk gagal (lihat artifact 'susfs-hasil' -> rejects/)"
+            for f in $(find . -name '*.rej' -not -path './.git/*'); do
+              echo "::group::ISI $f"
+              cat "$f"
+              echo "::endgroup::"
+            done
+            echo "::error::$n file punya hunk gagal. Isi lengkap ada di log (grup 'ISI ...') dan artifact susfs-hasil/rejects/"
             exit 1
           fi
 
