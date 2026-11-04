@@ -384,7 +384,7 @@ jobs:
               os.remove(rej)
               print("[fixup] kernel/sys.c OK")
 
-          # security/selinux/avc.c: spoof log avc untuk sid KSU
+          # security/selinux/avc.c: spoof log avc untuk sid KSU (bentuk kode Hana: variabel scontext, tanpa var tclass)
           def fix_avc():
               p = "security/selinux/avc.c"
               rej = p + ".rej"
@@ -392,24 +392,39 @@ jobs:
                   return
               s = read(p)
               if "bypass_target_context" not in s:
-                  m = re.search(r'\trc = security_sid_to_context\([^;]*?sad->tsid,\s*&tcontext,\s*&tcontext_len\);\n', s)
+                  m = re.search(r'\trc = security_sid_to_context\([^;]*?sad->tsid,\s*&(\w+),\s*&(\w+)\);\n', s)
                   if not m:
                       sys.exit("::error::fixup avc.c: security_sid_to_context(... sad->tsid ...) tidak ditemukan")
+                  var = m.group(1)
+                  # kalau kode asli membebaskan variabel itu sendiri (kfree), cabang spoof juga harus membebaskannya
+                  frees = ("kfree(%s)" % var) in s[m.end():m.end() + 300]
+                  if frees:
+                      ok_branch = ("\t\telse {\n"
+                                   "\t\t\taudit_log_format(ab, \" tcontext=%s\", \"u:r:priv_app:s0:c512,c768\");\n"
+                                   "\t\t\tkfree(" + var + ");\n"
+                                   "\t\t}\n")
+                  else:
+                      ok_branch = ("\t\telse\n"
+                                   "\t\t\taudit_log_format(ab, \" tcontext=%s\",\n"
+                                   "\t\t\t\t\t \"u:r:priv_app:s0:c512,c768\");\n")
                   blk = ("#ifdef CONFIG_KSU_SUSFS\n"
                          "\tif (static_branch_likely(&susfs_is_avc_log_spoofing_enabled) &&\n"
                          "\t    unlikely(sad->tsid == susfs_ksu_sid)) {\n"
                          "\t\tif (rc)\n"
                          "\t\t\taudit_log_format(ab, \" tsid=%d\", susfs_priv_app_sid);\n"
-                         "\t\telse\n"
-                         "\t\t\taudit_log_format(ab, \" tcontext=%s\",\n"
-                         "\t\t\t\t\t \"u:r:priv_app:s0:c512,c768\");\n"
+                         + ok_branch +
                          "\t\tgoto bypass_target_context;\n"
                          "\t}\n"
                          "#endif\n")
                   s = s[:m.end()] + blk + s[m.end():]
-                  t = s.find("\ttclass = secclass_map[sad->tclass-1].name;\n", m.end())
+                  t = -1
+                  for anchor in ('\taudit_log_format(ab, " tclass=%s", secclass_map[sad->tclass-1].name);\n',
+                                 '\ttclass = secclass_map[sad->tclass-1].name;\n'):
+                      t = s.find(anchor, m.end() + len(blk))
+                      if t >= 0:
+                          break
                   if t < 0:
-                      sys.exit("::error::fixup avc.c: baris tclass = secclass_map[...] tidak ditemukan")
+                      sys.exit("::error::fixup avc.c: baris tclass (secclass_map[sad->tclass-1].name) tidak ditemukan")
                   s = s[:t] + "#ifdef CONFIG_KSU_SUSFS\nbypass_target_context:\n#endif\n" + s[t:]
                   write(p, s)
               os.remove(rej)
@@ -446,12 +461,16 @@ jobs:
               os.remove(rej)
               print("[fixup] fs/proc/task_mmu.c OK (%d pemanggilan)" % changed[0])
 
-          fix_fd()
-          fix_mount()
-          fix_namei()
-          fix_sys()
-          fix_avc()
-          fix_taskmmu()
+          failed = []
+          for fn in (fix_fd, fix_mount, fix_namei, fix_sys, fix_avc, fix_taskmmu):
+              try:
+                  fn()
+              except SystemExit as e:
+                  print(e.code)
+                  failed.append(fn.__name__)
+          if failed:
+              print("::error::fixup gagal: " + ", ".join(failed))
+              sys.exit(1)
           PYEOF
           python3 -I "$RUNNER_TEMP/fixups.py"
 
