@@ -36,9 +36,17 @@ on:
         required: true
         default: "main"
       suki_ref:
-        description: "Commit SukiSU-Ultra (harus sama dengan yang dipakai workflow SUSFS)"
+        description: "Branch/commit SukiSU-Ultra asli (dipakai HANYA kalau susfs tidak dicentang)"
         required: true
-        default: "b1d534bc41941b2c818d7a1a1dac341e4aabfc2d"
+        default: "builtin"
+      susfs_src_repo:
+        description: "Repo sumber SukiSU+SUSFS yang sudah cocok satu sama lain (dipakai kalau susfs dicentang)"
+        required: true
+        default: "WiteTanuki/W200DS-SukiSU-Kernel"
+      susfs_src_ref:
+        description: "Commit repo sumber itu (harus sama dengan yang dipakai workflow SUSFS)"
+        required: true
+        default: "6115363983c7a2f517a9b1d1f777dcd8b29bb1c9"
 
 permissions:
   contents: read
@@ -84,20 +92,41 @@ jobs:
         if: ${{ inputs.root == 'sukisu' }}
         env:
           SUKI_REF: ${{ inputs.suki_ref }}
+          SUSFS: ${{ inputs.susfs }}
+          SRC_REPO: ${{ inputs.susfs_src_repo }}
+          SRC_REF: ${{ inputs.susfs_src_ref }}
         run: |
           set -e
           cd kernel
 
           # drivers/kernelsu adalah symlink ke ../KernelSU-Next/kernel (bawaan Hana).
-          # Folder KernelSU-Next kita ganti isinya dengan SukiSU, symlink tetap dipakai.
-          # Pakai fetch (bukan clone -b) supaya bisa menerima nomor commit maupun nama branch.
+          # Isi folder KernelSU-Next kita ganti, symlink tetap dipakai.
           rm -rf KernelSU-Next
-          git init -q KernelSU-Next
-          git -C KernelSU-Next remote add origin https://github.com/SukiSU-Ultra/SukiSU-Ultra.git
-          git -C KernelSU-Next fetch -q --depth=1 origin "$SUKI_REF"
-          git -C KernelSU-Next checkout -q FETCH_HEAD
-          git -C KernelSU-Next log -1 --oneline
-          test -f KernelSU-Next/kernel/Kconfig || { echo "::error::SukiSU tidak punya kernel/Kconfig di $SUKI_REF"; exit 1; }
+          if [ "$SUSFS" = "true" ]; then
+            # SukiSU upstream memanggil API SUSFS dengan bentuk berbeda dari SUSFS 5.4 yang kita pakai.
+            # Pakai drivers/kernelsu dari repo sumber SUSFS, yang sudah disesuaikan dan terbukti compile bersama.
+            echo "Sumber root: $SRC_REPO @ $SRC_REF"
+            T="$RUNNER_TEMP/ksusrc"
+            rm -rf "$T"
+            git init -q "$T"
+            git -C "$T" remote add origin "https://github.com/$SRC_REPO.git"
+            git -C "$T" config core.sparseCheckout true
+            echo "drivers/kernelsu/" > "$T/.git/info/sparse-checkout"
+            git -C "$T" fetch -q --depth=1 --filter=blob:none origin "$SRC_REF"
+            git -C "$T" checkout -q FETCH_HEAD
+            git -C "$T" log -1 --oneline
+            test -d "$T/drivers/kernelsu" || { echo "::error::drivers/kernelsu tidak ada di $SRC_REPO @ $SRC_REF"; exit 1; }
+            mkdir -p KernelSU-Next
+            cp -a "$T/drivers/kernelsu" KernelSU-Next/kernel
+          else
+            # Pakai fetch (bukan clone -b) supaya bisa menerima nomor commit maupun nama branch.
+            git init -q KernelSU-Next
+            git -C KernelSU-Next remote add origin https://github.com/SukiSU-Ultra/SukiSU-Ultra.git
+            git -C KernelSU-Next fetch -q --depth=1 origin "$SUKI_REF"
+            git -C KernelSU-Next checkout -q FETCH_HEAD
+            git -C KernelSU-Next log -1 --oneline
+          fi
+          test -f KernelSU-Next/kernel/Kconfig || { echo "::error::SukiSU tidak punya kernel/Kconfig"; exit 1; }
           test -f drivers/kernelsu/Kconfig || { echo "::error::symlink drivers/kernelsu rusak"; exit 1; }
           grep -n "kernelsu" drivers/Makefile drivers/Kconfig
 
@@ -161,6 +190,7 @@ jobs:
         if: ${{ inputs.root == 'sukisu' && inputs.susfs }}
         env:
           GH_TOKEN: ${{ github.token }}
+          SRC_REF: ${{ inputs.susfs_src_ref }}
         run: |
           set -e
           gh release download susfs-hana-latest --repo "$GITHUB_REPOSITORY" \
@@ -168,10 +198,9 @@ jobs:
           echo "=== info patch ==="
           cat "$RUNNER_TEMP/susfs-hana.info"
 
-          # patch dibuat terhadap SukiSU tertentu; peringatkan kalau beda
-          SHA=$(git -C kernel/KernelSU-Next rev-parse HEAD)
-          grep -q "$SHA" "$RUNNER_TEMP/susfs-hana.info" || \
-            echo "::warning::SukiSU yang dipakai ($SHA) BEDA dengan yang dipakai saat patch SUSFS dibuat. Jalankan ulang workflow SUSFS dengan suki_ref yang sama."
+          # patch dibuat dari commit sumber tertentu; peringatkan kalau beda dengan yang dipakai di sini
+          grep -q "$SRC_REF" "$RUNNER_TEMP/susfs-hana.info" || \
+            echo "::warning::Commit sumber SUSFS di workflow ini ($SRC_REF) BEDA dengan yang dipakai saat patch dibuat. Jalankan ulang workflow 'Build SUSFS patch' dengan susfs_ref yang sama."
 
           cd kernel
           find . -name '*.rej' -not -path './.git/*' | sort > "$RUNNER_TEMP/rej_before.txt"
