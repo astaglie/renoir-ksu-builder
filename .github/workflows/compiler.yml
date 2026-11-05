@@ -1,663 +1,538 @@
-name: Build SUSFS patch (Hana renoir 5.4)
+name: Renoir MIUI 14 - Kernel Hana + SukiSU Ultra (+SUSFS)
+
+# Dasar kernel: Hana-kernel (ponces/android_kernel_xiaomi_sm8350-miui, Linux 5.4.283).
+# Patch SUSFS diambil otomatis dari release "susfs-hana-latest" (dibuat oleh workflow "Build SUSFS patch").
+# Urutan pakai: 1) jalankan "Build SUSFS patch"  2) jalankan workflow ini.
 
 on:
   workflow_dispatch:
     inputs:
-      kernel_ref:
-        description: "Branch/tag kernel Hana (target patch)"
+      root:
+        description: "sukisu = SukiSU Ultra | ksunext = sama persis dengan rilis Hana (uji dasar) | none = tanpa root"
         required: true
-        default: "main"
-      suki_ref:
-        description: "Commit/branch SukiSU-Ultra yang cocok dengan SUSFS sumber"
-        required: true
-        default: "b1d534bc41941b2c818d7a1a1dac341e4aabfc2d"
-      susfs_repo:
-        description: "Repo sumber SUSFS yang sudah jalan dengan SukiSU di 5.4"
-        required: true
-        default: "WiteTanuki/W200DS-SukiSU-Kernel"
-      susfs_ref:
-        description: "Branch/tag repo sumber SUSFS"
-        required: true
-        default: "main"
-      base_repo:
-        description: "Repo dasar (kernel asli tanpa SUSFS) untuk dibandingkan"
-        required: true
-        default: "Ssrml/android_kernel_zte_ums9620_p720_w205ds"
-      base_ref:
-        description: "Branch/tag repo dasar (kosong = default branch)"
-        required: false
-        default: ""
-      publish:
-        description: "Publikasikan ke release susfs-hana-latest kalau patch bersih"
+        type: choice
+        default: "sukisu"
+        options:
+          - sukisu
+          - ksunext
+          - none
+      susfs:
+        description: "Pasang SUSFS (hanya kalau root = sukisu)"
         required: true
         type: boolean
         default: true
+      kpm:
+        description: "Coba aktifkan KPM (eksperimen, bisa gagal compile di 5.4)"
+        required: true
+        type: boolean
+        default: false
+      adbroot:
+        description: "Coba aktifkan ADB Root (eksperimen)"
+        required: true
+        type: boolean
+        default: false
+      kernel_ref:
+        description: "Branch/tag kernel Hana"
+        required: true
+        default: "main"
+      suki_ref:
+        description: "Branch/commit SukiSU-Ultra asli (dipakai HANYA kalau susfs tidak dicentang)"
+        required: true
+        default: "builtin"
+      susfs_src_repo:
+        description: "Repo sumber SukiSU+SUSFS yang sudah cocok satu sama lain (dipakai kalau susfs dicentang)"
+        required: true
+        default: "WiteTanuki/W200DS-SukiSU-Kernel"
+      susfs_src_ref:
+        description: "Commit repo sumber itu (harus sama dengan yang dipakai workflow SUSFS)"
+        required: true
+        default: "6115363983c7a2f517a9b1d1f777dcd8b29bb1c9"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  susfs:
+  build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 360
     steps:
+      - name: Checkout kernel Hana
+        uses: actions/checkout@v4
+        with:
+          repository: ponces/android_kernel_xiaomi_sm8350-miui
+          ref: ${{ inputs.kernel_ref }}
+          submodules: true
+          fetch-depth: 1
+          path: kernel
+
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
           df -h /
 
-      - name: Checkout kernel Hana (target)
-        uses: actions/checkout@v4
-        with:
-          repository: ponces/android_kernel_xiaomi_sm8350-miui
-          ref: ${{ inputs.kernel_ref }}
-          fetch-depth: 1
-          submodules: false
-          path: hana
-
-      - name: Checkout sumber SUSFS
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ inputs.susfs_repo }}
-          ref: ${{ inputs.susfs_ref }}
-          fetch-depth: 1
-          path: src
-
-      - name: Checkout kernel dasar
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ inputs.base_repo }}
-          ref: ${{ inputs.base_ref }}
-          fetch-depth: 1
-          path: base
-
-      - name: Checkout SukiSU (untuk cek API)
-        uses: actions/checkout@v4
-        with:
-          repository: SukiSU-Ultra/SukiSU-Ultra
-          ref: ${{ inputs.suki_ref }}
-          fetch-depth: 1
-          path: suki
-
-      - name: Info versi
+      - name: Install dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          for d in hana src base suki; do
-            echo "$d: $(git -C $d log -1 --format='%H %s' | cut -c1-100)"
-          done
-          make -C hana -s kernelversion || true
-          echo "--- SUSFS di sumber ---"
-          grep -n "define SUSFS_VERSION" src/include/linux/susfs.h || echo "::error::src/include/linux/susfs.h tidak punya SUSFS_VERSION"
-          test -f src/fs/susfs.c || { echo "::error::src/fs/susfs.c tidak ada"; exit 1; }
-          echo "--- hook KSU yang SUDAH ada di Hana (kalau ada, bisa bentrok) ---"
-          grep -rln "ksu_handle_" hana/fs hana/kernel hana/drivers/input 2>/dev/null | head -20 || true
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential clang curl flex git libssl-dev lld llvm \
+            python3 python-is-python3 zip zstd file cpio xz-utils
+          clang --version | head -1
 
-      - name: Buat patch mentah (selisih SUSFS/KSU saja)
+      - name: Info sumber kernel
+        run: |
+          cd kernel
+          git log -1 --oneline || true
+          make -s kernelversion
+          ls -la drivers/kernelsu || true
+          ls KernelSU-Next | head -5 || true
+
+      - name: Ganti KernelSU-Next dengan SukiSU Ultra + penyesuaian kernel 5.4
+        if: ${{ inputs.root == 'sukisu' }}
+        env:
+          SUKI_REF: ${{ inputs.suki_ref }}
+          SUSFS: ${{ inputs.susfs }}
+          SRC_REPO: ${{ inputs.susfs_src_repo }}
+          SRC_REF: ${{ inputs.susfs_src_ref }}
         run: |
           set -e
-          mkdir -p result
-          cat > "$RUNNER_TEMP/mkpatch.py" <<'PYEOF'
-          #!/usr/bin/env python3
-          """Selisih src vs base, hanya hunk yang menyentuh SUSFS/KSU.
-          Pemakaian: mkpatch.py <src> <base> <output.patch> <hana>"""
-          import os, re, subprocess, sys
+          cd kernel
 
-          src, base, outpath, hana = sys.argv[1:5]
-          KEY = re.compile(r"susfs|ksu|sus_su", re.I)
-          EXCL_PREFIX = ("drivers/kernelsu/", "Documentation/", "tools/", "scripts/")
-          # Hana sudah punya baris source/obj untuk drivers/kernelsu lewat symlink
-          EXCL_FILES = {"drivers/Kconfig", "drivers/Makefile"}
-          # dari drivers/ hanya hook input yang dipakai SUSFS (sisanya driver vendor, bukan urusan SUSFS)
-          ALLOW_DRIVERS = {"drivers/input/input.c"}
-          # fs/proc/task_mmu.c: struktur smap_gather_stats di sumber SUSFS jauh beda dari Hana
-          # (parameter "start", CONFIG_ENHANCE_SMAPS_INFO, dll). Menempel otomatis di sini berisiko
-          # salah posisi (merusak batas fungsi) tanpa kelihatan sebagai error patch. Dikecualikan:
-          # fitur sus_map (hide vma tertentu di /proc/pid/smaps) jadi tidak aktif, fitur lain tetap jalan.
-          EXCL_FILES = EXCL_FILES | {"fs/proc/task_mmu.c"}
-          DIRS = ["fs", "include", "kernel", "mm", "security", "drivers",
-                  "init", "net", "ipc", "lib", "block", "crypto"]
-          HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
+          # drivers/kernelsu adalah symlink ke ../KernelSU-Next/kernel (bawaan Hana).
+          # Isi folder KernelSU-Next kita ganti, symlink tetap dipakai.
+          rm -rf KernelSU-Next
+          if [ "$SUSFS" = "true" ]; then
+            # SukiSU upstream memanggil API SUSFS dengan bentuk berbeda dari SUSFS 5.4 yang kita pakai.
+            # Pakai drivers/kernelsu dari repo sumber SUSFS, yang sudah disesuaikan dan terbukti compile bersama.
+            echo "Sumber root: $SRC_REPO @ $SRC_REF"
+            T="$RUNNER_TEMP/ksusrc"
+            rm -rf "$T"
+            git init -q "$T"
+            git -C "$T" remote add origin "https://github.com/$SRC_REPO.git"
+            git -C "$T" config core.sparseCheckout true
+            echo "drivers/kernelsu/" > "$T/.git/info/sparse-checkout"
+            git -C "$T" fetch -q --depth=1 --filter=blob:none origin "$SRC_REF"
+            git -C "$T" checkout -q FETCH_HEAD
+            git -C "$T" log -1 --oneline
+            test -d "$T/drivers/kernelsu" || { echo "::error::drivers/kernelsu tidak ada di $SRC_REPO @ $SRC_REF"; exit 1; }
+            mkdir -p KernelSU-Next
+            cp -a "$T/drivers/kernelsu" KernelSU-Next/kernel
+          else
+            # Pakai fetch (bukan clone -b) supaya bisa menerima nomor commit maupun nama branch.
+            git init -q KernelSU-Next
+            git -C KernelSU-Next remote add origin https://github.com/SukiSU-Ultra/SukiSU-Ultra.git
+            git -C KernelSU-Next fetch -q --depth=1 origin "$SUKI_REF"
+            git -C KernelSU-Next checkout -q FETCH_HEAD
+            git -C KernelSU-Next log -1 --oneline
+          fi
+          test -f KernelSU-Next/kernel/Kconfig || { echo "::error::SukiSU tidak punya kernel/Kconfig"; exit 1; }
+          test -f drivers/kernelsu/Kconfig || { echo "::error::symlink drivers/kernelsu rusak"; exit 1; }
+          grep -n "kernelsu" drivers/Makefile drivers/Kconfig
 
-          cmd = ["grep", "-rIlE", "susfs|SUSFS|CONFIG_KSU|ksu_",
-                 "--include=*.c", "--include=*.h", "--include=Makefile",
-                 "--include=Kconfig*", "--include=*.Kconfig"] + DIRS
-          r = subprocess.run(cmd, cwd=src, capture_output=True)
-          cands = sorted(f for f in r.stdout.decode("utf-8", "surrogateescape").split("\n")
-                         if f and not f.startswith(EXCL_PREFIX) and f not in EXCL_FILES
-                         and (not f.startswith("drivers/") or f in ALLOW_DRIVERS))
+          K=KernelSU-Next/kernel
 
-          out = []
-          total_files = total_hunks = 0
-          for rel in cands:
-              s = os.path.join(src, rel)
-              b = os.path.join(base, rel)
-              if os.path.islink(s) or not os.path.isfile(s):
-                  continue
-              new = not os.path.exists(b)
-              if not new and not os.path.exists(os.path.join(hana, rel)):
-                  print("%-48s dilewati (tidak ada di Hana)" % rel)
-                  continue
-              if new:
-                  cmd = ["diff", "-u", "-L", "/dev/null", "-L", "b/" + rel, "/dev/null", s]
-              else:
-                  cmd = ["diff", "-u", "-L", "a/" + rel, "-L", "b/" + rel, b, s]
-              p = subprocess.run(cmd, capture_output=True)
-              if p.returncode == 0:
-                  continue  # tidak beda
-              text = p.stdout.decode("utf-8", "surrogateescape")
-              lines = text.split("\n")
-              if lines and lines[-1] == "":
-                  lines.pop()
-              try:
-                  first = next(i for i, l in enumerate(lines) if l.startswith("@@"))
-              except StopIteration:
-                  continue
-              header = lines[:first]
-              hunks, cur = [], None
-              for l in lines[first:]:
-                  if l.startswith("@@") and HUNK.match(l):
-                      cur = [l]
-                      hunks.append(cur)
-                  else:
-                      cur.append(l)
+          # 1. linux/static_call.h hanya ada di kernel 5.10+
+          if [ ! -f include/linux/static_call.h ]; then
+            grep -rl "linux/static_call.h" "$K" | xargs -r sed -i -E 's|^([[:space:]]*)#[[:space:]]*include <linux/static_call.h>|\1/* disabled for 5.4: linux/static_call.h */|'
+          fi
 
-              kept, delta, mixed = [], 0, 0
-              for h in hunks:
-                  m = HUNK.match(h[0])
-                  a = int(m.group(1)); bl = int(m.group(2)) if m.group(2) is not None else 1
-                  d = int(m.group(4)) if m.group(4) is not None else 1
-                  body = h[1:]
-                  changed = [x for x in body if x[:1] in ("+", "-")]
-                  hit = [x for x in changed if KEY.search(x)]
-                  if not hit:
-                      continue
-                  noise = re.compile(r"^[+-]\s*(#\s*(endif|else)\b.*|[{}]?)\s*$")
-                  other = [x for x in changed if not KEY.search(x) and not noise.match(x)]
-                  if other:
-                      mixed += 1
-                  if bl == 0:
-                      c = a + delta + (1 if d > 0 else 0)
-                  else:
-                      c = a + delta
-                  delta += d - bl
-                  kept.append("@@ -%d,%d +%d,%d @@%s" % (a, bl, c, d, m.group(5)))
-                  kept.extend(body)
-              if not kept:
-                  continue
-              out.append("diff --git a/%s b/%s" % (rel, rel))
-              if new:
-                  out.append("new file mode 100644")
-              out.extend(header)
-              out.extend(kept)
-              nh = sum(1 for x in kept if x.startswith("@@"))
-              total_files += 1
-              total_hunks += nh
-              print("%-48s %s %2d hunk%s" % (rel, "BARU" if new else "    ", nh,
-                    ("  (%d hunk campur non-SUSFS, cek manual)" % mixed) if mixed else ""))
+          # 2. linux/hex.h tidak ada di kernel 5.4
+          if [ ! -f include/linux/hex.h ]; then
+            grep -rl "<linux/hex.h>" "$K" | xargs -r sed -i 's|<linux/hex.h>|<linux/kernel.h>|'
+          fi
 
-          with open(outpath, "w", encoding="utf-8", errors="surrogateescape") as f:
-              f.write("\n".join(out) + "\n")
-          print("TOTAL: %d file, %d hunk" % (total_files, total_hunks))
-          if total_files == 0:
-              sys.exit("::error::patch kosong, sumber SUSFS tidak berisi hunk yang cocok")
-          PYEOF
-          python3 -I "$RUNNER_TEMP/mkpatch.py" src base result/raw.patch hana
-          ls -la result/raw.patch
+          # 3. makro fallthrough (kernel Hana sudah punya; ini hanya jaga-jaga)
+          if ! grep -qs "define[[:space:]]\+fallthrough" include/linux/compiler_attributes.h include/linux/compiler.h include/linux/compiler-clang.h; then
+            F="$K/kernel_includes.h"
+            if [ -f "$F" ]; then
+              last=$(grep -n '^#include' "$F" | tail -1 | cut -d: -f1)
+              sed -i "${last}a #ifndef fallthrough\n#define fallthrough do {} while (0)\n#endif" "$F"
+            fi
+          fi
 
-      - name: Terapkan ke Hana
-        id: apply
+          # 4. arch.h: sudah ada di SukiSU. Ambil dari luar hanya kalau memang hilang.
+          if ! find "$K" -name arch.h | grep -q .; then
+            curl -fsSL -o "$K/include/arch.h" https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/include/arch.h \
+              || echo "::warning::gagal mengambil arch.h"
+          fi
+
+          # 5. cpu_spoof.c memakai clocksource->vdso_clock_mode (baru ada di kernel 5.10+).
+          #    Field int ditambah di AKHIR struct clocksource supaya offset field lain tidak bergeser.
+          CLK=include/linux/clocksource.h
+          if grep -rq "vdso_clock_mode" "$K" && ! grep -q "vdso_clock_mode;" "$CLK"; then
+            awk '
+              /^struct clocksource[[:space:]]*\{/ { in_cs=1 }
+              in_cs && /^\}.*;/ {
+                print "\t/* compat 5.4: dipakai SukiSU cpu_spoof, tidak dibaca vDSO kernel 5.4 */"
+                print "\tint vdso_clock_mode;"
+                in_cs=0
+              }
+              { print }
+            ' "$CLK" > "$CLK.new" && mv "$CLK.new" "$CLK"
+            grep -q "int vdso_clock_mode;" "$CLK" || { echo "::error::gagal menyisipkan vdso_clock_mode"; exit 1; }
+          fi
+
+          # 6. fungsi SUSFS dipanggil walau SUSFS tidak dipasang
+          PO=$(find "$K" -name pkg_observer.c | head -1)
+          if [ -n "$PO" ] && grep -q "susfs_parse_priority_app_strings" "$PO"; then
+            line=$(grep -n '^#include' "$PO" | tail -1 | cut -d: -f1)
+            sed -i "${line}a #ifndef CONFIG_KSU_SUSFS\n#ifndef susfs_parse_priority_app_strings\n#define susfs_parse_priority_app_strings(...) (0)\n#endif\n#endif" "$PO"
+          fi
+
+          # 7. matikan preinit SukiSU (butuh header userspace dan fitur kernel 5.3+)
+          if [ -f "$K/Makefile" ]; then
+            sed -i -E 's|^([[:space:]]*KSU_UAPI_INC[[:space:]]*:?=[[:space:]]*).*$|\1$(objtree)/usr/include-ksu-disabled|' "$K/Makefile"
+            grep -n "KSU_UAPI_INC :=" "$K/Makefile" || echo "::warning::KSU_UAPI_INC tidak ditemukan"
+          fi
+
+      - name: Pasang patch SUSFS (dari release susfs-hana-latest)
+        if: ${{ inputs.root == 'sukisu' && inputs.susfs }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SRC_REF: ${{ inputs.susfs_src_ref }}
         run: |
-          cd hana
-          mkdir -p ../result
-          find . -name '*.rej' -not -path './.git/*' | sort > ../result/rej_before.txt
-          echo "File .rej bawaan repo Hana (diabaikan):"
-          cat ../result/rej_before.txt
+          set -e
+          gh release download susfs-hana-latest --repo "$GITHUB_REPOSITORY" \
+            -p susfs-hana.patch -p susfs-hana.info -D "$RUNNER_TEMP" --clobber
+          echo "=== info patch ==="
+          cat "$RUNNER_TEMP/susfs-hana.info"
+
+          # patch dibuat dari commit sumber tertentu; peringatkan kalau beda dengan yang dipakai di sini
+          grep -q "$SRC_REF" "$RUNNER_TEMP/susfs-hana.info" || \
+            echo "::warning::Commit sumber SUSFS di workflow ini ($SRC_REF) BEDA dengan yang dipakai saat patch dibuat. Jalankan ulang workflow 'Build SUSFS patch' dengan susfs_ref yang sama."
+
+          cd kernel
+          find . -name '*.rej' -not -path './.git/*' | sort > "$RUNNER_TEMP/rej_before.txt"
           set +e
-          # fuzz 2 (bawaan): fuzz 3 bisa menempel di tempat yang salah tanpa ketahuan
-          patch -p1 --batch --no-backup-if-mismatch -F2 < ../result/raw.patch | tee ../result/apply.log
+          patch -p1 --batch --no-backup-if-mismatch -F2 < "$RUNNER_TEMP/susfs-hana.patch" | tee "$RUNNER_TEMP/susfs-apply.log"
           rc=${PIPESTATUS[0]}
           set -e
           echo "patch exit code: $rc"
-          grep -E "with fuzz|FAILED|Skipping|ignored" ../result/apply.log || true
+          find . -name '*.rej' -not -path './.git/*' | sort > "$RUNNER_TEMP/rej_after.txt"
+          new=$(comm -13 "$RUNNER_TEMP/rej_before.txt" "$RUNNER_TEMP/rej_after.txt")
+          if [ -n "$new" ]; then
+            for f in $new; do echo "################ REJ: $f"; cat "$f"; done
+            echo "::error::patch SUSFS ada hunk gagal. Jalankan ulang workflow 'Build SUSFS patch' dengan kernel_ref yang sama."
+            exit 1
+          fi
+          test -f fs/susfs.c || { echo "::error::fs/susfs.c tidak ada setelah patch"; exit 1; }
+          echo "Patch SUSFS terpasang."
 
-          # --- perbaikan khusus Hana (hunk yang tidak cocok dengan source Hana) ---
-          cat > "$RUNNER_TEMP/fixups.py" <<'PYEOF'
-          import os, re, sys
+          echo "=== cek: fungsi ksu_handle_* yang dipanggil kernel vs yang didefinisikan SukiSU ==="
+          K=KernelSU-Next/kernel
+          for f in $(grep -rhoE '\bksu_handle_[a-z0-9_]+\(' fs kernel drivers/input mm security include 2>/dev/null | tr -d '(' | sort -u); do
+            if grep -rhE "^([A-Za-z_][^;(]*[ *])?$f\(" "$K" --include=*.c 2>/dev/null | grep -vE '^extern |;[[:space:]]*$' | grep -q .; then
+              echo "ok   $f"
+            else
+              echo "::warning::tidak ketemu definisi $f di SukiSU (kalau nanti error link 'undefined', ini penyebabnya)"
+            fi
+          done
 
-          def tabify(block):
-              out = []
-              for l in block.split("\n"):
-                  n = len(l) - len(l.lstrip(" "))
-                  out.append("\t" * (n // 4) + " " * (n % 4) + l.lstrip(" "))
-              return "\n".join(out)
+      - name: Pasang hook manual SukiSU ke kernel (exec, faccessat, stat, read, input, reboot)
+        if: ${{ inputs.root == 'sukisu' && !inputs.susfs }}
+        run: |
+          set -e
+          cat > "$RUNNER_TEMP/ksu_hooks.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          """Pasang hook manual SukiSU-Ultra (builtin) ke kernel 5.4 Hana.
+          Pemakaian: python3 ksu_hooks.py <root-kernel>
+          Setiap titik sisip dicari persis; kalau tidak ketemu, berhenti dengan pesan jelas."""
+          import sys, os
 
-          # fs/proc/fd.c: Hana lama belum punya baris "ino:" di fdinfo, jadi hunk #3 meleset.
-          FD_BLOCK = r"""#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
-              if (SUSFS_IS_INODE_OPEN_REDIRECT(file_inode(file)) &&
-                  !susfs_open_redirect_spoof_seq_show(file_inode(file),
-                                                      &spoofed_mnt_id, &spoofed_ino)) {
-                  seq_printf(m, "pos:\t%lli\nflags:\t0%o\nmnt_id:\t%i\nino:\t%lu\n",
-                             (long long)file->f_pos, f_flags,
-                             spoofed_mnt_id, spoofed_ino);
-                  goto bypass_orig_flow;
-              }
-          #endif
-
-          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-              mnt = real_mount(file->f_path.mnt);
-              if (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) &&
-                  mnt->mnt_id >= DEFAULT_SUS_MNT_ID) {
-                  struct path path;
-                  char *pathname = kmalloc(PAGE_SIZE, GFP_KERNEL);
-                  char *dpath;
-
-                  for (; mnt->mnt_id >= DEFAULT_SUS_MNT_ID; mnt = mnt->mnt_parent) { }
-
-                  if (!pathname) {
-                      goto out_seq_printf;
-                  }
-                  dpath = d_path(&file->f_path, pathname, PAGE_SIZE);
-                  if (!dpath) {
-                      goto out_free_pathname;
-                  }
-                  if (kern_path(dpath, 0, &path)) {
-                      goto out_free_pathname;
-                  }
-                  seq_printf(m, "pos:\t%lli\nflags:\t0%o\nmnt_id:\t%i\nino:\t%lu\n",
-                             (long long)file->f_pos, f_flags,
-                             mnt->mnt_id,
-                             path.dentry->d_inode->i_ino);
-                  path_put(&path);
-                  kfree(pathname);
-                  goto bypass_orig_flow;
-          out_free_pathname:
-                  kfree(pathname);
-              }
-          out_seq_printf:
-              seq_printf(m, "pos:\t%lli\nflags:\t0%o\nmnt_id:\t%i\nino:\t%lu\n",
-                         (long long)file->f_pos, f_flags,
-                         mnt->mnt_id,
-                         file_inode(file)->i_ino);
-          #else
-              seq_printf(m, "pos:\t%lli\nflags:\t0%o\nmnt_id:\t%i\nino:\t%lu\n",
-                         (long long)file->f_pos, f_flags,
-                         real_mount(file->f_path.mnt)->mnt_id,
-                         file_inode(file)->i_ino);
-          #endif
-
-          #if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
-          bypass_orig_flow:
-          #endif
-              show_fd_locks(m, file, files);
-          """
-
-          def fix_fd():
-              p = "fs/proc/fd.c"
-              rej = p + ".rej"
-              if not os.path.exists(rej):
-                  return
-              s = open(p, encoding="utf-8", errors="surrogateescape").read()
-              pat = re.compile(
-                  r'\tseq_printf\(m, "pos:\\t%lli\\nflags:\\t0%o\\nmnt_id:\\t%i\\n",\n'
-                  r'\s+\(long long\)file->f_pos, f_flags,\n'
-                  r'\s+real_mount\(file->f_path\.mnt\)->mnt_id\);\n\n'
-                  r'\tshow_fd_locks\(m, file, files\);\n')
-              m = pat.search(s)
-              if not m:
-                  sys.exit("::error::fixup fd.c: bagian seq_printf asli tidak ditemukan di Hana")
-              s = s[:m.start()] + tabify(FD_BLOCK) + s[m.end():]
-              open(p, "w", encoding="utf-8", errors="surrogateescape").write(s)
-              os.remove(rej)
-              print("[fixup] fs/proc/fd.c OK")
+          root = sys.argv[1]
+          MARK = "KSU manual hook"
 
 
-          # include/linux/mount.h: pakai slot KABI no.4 di struct vfsmount (ukuran struct tidak berubah)
-          def fix_mount():
-              p = "include/linux/mount.h"
-              rej = p + ".rej"
-              if not os.path.exists(rej):
-                  return
-              s = open(p, encoding="utf-8", errors="surrogateescape").read()
-              if "susfs_mnt_id_backup" not in s:
-                  i = s.find("struct vfsmount {")
-                  old = "\tANDROID_KABI_RESERVE(4);\n"
-                  j = s.find(old, i)
-                  if i < 0 or j < 0:
-                      sys.exit("::error::fixup mount.h: ANDROID_KABI_RESERVE(4) tidak ditemukan di struct vfsmount")
-                  new = ("#ifdef CONFIG_KSU_SUSFS\n\tANDROID_KABI_USE(4, u64 susfs_mnt_id_backup);\n"
-                         "#else\n\tANDROID_KABI_RESERVE(4);\n#endif\n")
-                  s = s[:j] + new + s[j + len(old):]
-                  open(p, "w", encoding="utf-8", errors="surrogateescape").write(s)
-              os.remove(rej)
-              print("[fixup] include/linux/mount.h OK")
+          def load(rel):
+              with open(os.path.join(root, rel), "r", encoding="utf-8", errors="surrogateescape") as f:
+                  return f.read()
 
-          def read(p):
-              return open(p, encoding="utf-8", errors="surrogateescape").read()
 
-          def write(p, s):
-              open(p, "w", encoding="utf-8", errors="surrogateescape").write(s)
+          def save(rel, s):
+              with open(os.path.join(root, rel), "w", encoding="utf-8", errors="surrogateescape") as f:
+                  f.write(s)
 
-          # fs/namei.c: blok include + deklarasi di atas file (konteks Hana beda, jadi sisip setelah #include "mount.h")
-          def fix_namei():
-              p = "fs/namei.c"
-              rej = p + ".rej"
-              if not os.path.exists(rej):
-                  return
-              s = read(p)
-              if "KSU fixup namei" not in s:
-                  anchor = '#include "mount.h"\n'
-                  i = s.find(anchor)
-                  if i < 0:
-                      sys.exit('::error::fixup namei.c: #include "mount.h" tidak ditemukan')
-                  i += len(anchor)
-                  add = ("\n/* KSU fixup namei */\n"
-                         "#if defined(CONFIG_KSU_SUSFS_SUS_PATH) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n"
-                         "#include <linux/susfs.h>\n"
-                         "#endif\n\n"
-                         "#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n"
-                         "#ifndef EOPENREDIRECT\n#define EOPENREDIRECT 519\n#endif\n"
-                         "#endif\n\n"
-                         "#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n"
-                         "extern const struct qstr susfs_fake_qstr_name;\n"
-                         "#endif\n")
-                  s = s[:i] + add + s[i:]
-                  write(p, s)
-              os.remove(rej)
-              print("[fixup] fs/namei.c OK")
 
-          # kernel/sys.c: spoof uname di newuname
-          def fix_sys():
-              p = "kernel/sys.c"
-              rej = p + ".rej"
-              if not os.path.exists(rej):
-                  return
-              s = read(p)
-              if "susfs_spoof_uname(&tmp)" not in s:
-                  d = "SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)"
-                  i = s.find(d)
-                  if i < 0:
-                      sys.exit("::error::fixup sys.c: SYSCALL_DEFINE1(newuname ...) tidak ditemukan")
-                  m = "\tmemcpy(&tmp, utsname(), sizeof(tmp));\n"
-                  j = s.find(m, i)
-                  if j < 0 or j - i > 600:
-                      sys.exit("::error::fixup sys.c: memcpy(&tmp, utsname() ...) tidak ditemukan di newuname")
-                  j += len(m)
-                  s = s[:j] + "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n\tsusfs_spoof_uname(&tmp);\n#endif\n" + s[j:]
-                  if "extern void susfs_spoof_uname" not in s:
-                      s = (s[:i] + "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
-                           "extern void susfs_spoof_uname(struct new_utsname* tmp);\n#endif\n" + s[i:])
-                  write(p, s)
-              os.remove(rej)
-              print("[fixup] kernel/sys.c OK")
-
-          # security/selinux/avc.c: spoof log avc untuk sid KSU (bentuk kode Hana: variabel scontext, tanpa var tclass)
-          def fix_avc():
-              p = "security/selinux/avc.c"
-              rej = p + ".rej"
-              if not os.path.exists(rej):
-                  return
-              s = read(p)
-              if "bypass_target_context" not in s:
-                  m = re.search(r'\trc = security_sid_to_context\([^;]*?sad->tsid,\s*&(\w+),\s*&(\w+)\);\n', s)
-                  if not m:
-                      sys.exit("::error::fixup avc.c: security_sid_to_context(... sad->tsid ...) tidak ditemukan")
-                  var = m.group(1)
-                  # kalau kode asli membebaskan variabel itu sendiri (kfree), cabang spoof juga harus membebaskannya
-                  frees = ("kfree(%s)" % var) in s[m.end():m.end() + 300]
-                  if frees:
-                      ok_branch = ("\t\telse {\n"
-                                   "\t\t\taudit_log_format(ab, \" tcontext=%s\", \"u:r:priv_app:s0:c512,c768\");\n"
-                                   "\t\t\tkfree(" + var + ");\n"
-                                   "\t\t}\n")
-                  else:
-                      ok_branch = ("\t\telse\n"
-                                   "\t\t\taudit_log_format(ab, \" tcontext=%s\",\n"
-                                   "\t\t\t\t\t \"u:r:priv_app:s0:c512,c768\");\n")
-                  blk = ("#ifdef CONFIG_KSU_SUSFS\n"
-                         "\tif (static_branch_likely(&susfs_is_avc_log_spoofing_enabled) &&\n"
-                         "\t    unlikely(sad->tsid == susfs_ksu_sid)) {\n"
-                         "\t\tif (rc)\n"
-                         "\t\t\taudit_log_format(ab, \" tsid=%d\", susfs_priv_app_sid);\n"
-                         + ok_branch +
-                         "\t\tgoto bypass_target_context;\n"
-                         "\t}\n"
-                         "#endif\n")
-                  s = s[:m.end()] + blk + s[m.end():]
-                  t = -1
-                  for anchor in ('\taudit_log_format(ab, " tclass=%s", secclass_map[sad->tclass-1].name);\n',
-                                 '\ttclass = secclass_map[sad->tclass-1].name;\n'):
-                      t = s.find(anchor, m.end() + len(blk))
-                      if t >= 0:
-                          break
-                  if t < 0:
-                      sys.exit("::error::fixup avc.c: baris tclass (secclass_map[sad->tclass-1].name) tidak ditemukan")
-                  s = s[:t] + "#ifdef CONFIG_KSU_SUSFS\nbypass_target_context:\n#endif\n" + s[t:]
-                  write(p, s)
-              os.remove(rej)
-              print("[fixup] security/selinux/avc.c OK")
-
-          # fs/proc/task_mmu.c: dikecualikan dari patch otomatis (lihat EXCL_FILES di mkpatch.py), jadi
-          # fungsi ini sekarang tidak pernah menemukan .rej dan selalu no-op. Dibiarkan ada untuk jaga-jaga.
-          def fix_taskmmu():
-              p = "fs/proc/task_mmu.c"
-              rej = p + ".rej"
-              if not os.path.exists(rej):
-                  return
-              s = read(p)
-              i = s.find("static int show_smaps_rollup(struct seq_file *m, void *v)")
+          def find(s, rel, anchor, start=0):
+              i = s.find(anchor, start)
               if i < 0:
-                  sys.exit("::error::fixup task_mmu.c: show_smaps_rollup tidak ditemukan")
-              j = s.find("\n}\n", i)
-              if j < 0:
-                  sys.exit("::error::fixup task_mmu.c: akhir show_smaps_rollup tidak ditemukan")
-              body = s[i:j]
-              pat = re.compile(r'^(\t+)(smap_gather_stats\(vma, [^;]*\);)', re.M)
-              changed = [0]
-              def rep(m):
-                  if "susfs_is_vma_sus_map" in body[max(0, m.start() - 120):m.start()]:
-                      return m.group(0)
-                  changed[0] += 1
-                  ind = m.group(1)
-                  return ("#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n%sif (!susfs_is_vma_sus_map(vma))\n#endif\n%s\t%s"
-                          % (ind, ind, m.group(2)))
-              nb = pat.sub(rep, body)
-              if changed[0] == 0 and "susfs_is_vma_sus_map" not in body:
-                  sys.exit("::error::fixup task_mmu.c: pemanggilan smap_gather_stats(vma, ...) tidak ditemukan")
-              s = s[:i] + nb + s[j:]
-              write(p, s)
-              os.remove(rej)
-              print("[fixup] fs/proc/task_mmu.c OK (%d pemanggilan)" % changed[0])
+                  sys.exit("::error::[hook] titik sisip tidak ditemukan di %s: %r" % (rel, anchor))
+              return i
 
-          failed = []
-          for fn in (fix_fd, fix_mount, fix_namei, fix_sys, fix_avc, fix_taskmmu):
-              try:
-                  fn()
-              except SystemExit as e:
-                  print(e.code)
-                  failed.append(fn.__name__)
-          if failed:
-              print("::error::fixup gagal: " + ", ".join(failed))
-              sys.exit(1)
+
+          def ins_before(s, i, text):
+              return s[:i] + text + s[i:]
+
+
+          def patch(rel, fn):
+              s = load(rel)
+              if MARK in s:
+                  print("[hook] %s sudah dipasang, dilewati" % rel)
+                  return
+              s = fn(s, rel)
+              save(rel, s)
+              print("[hook] OK  %s" % rel)
+
+
+          def wrap(code):
+              return "#ifdef CONFIG_KSU /* %s */\n%s#endif\n" % (MARK, code)
+
+
+          # ---------- fs/exec.c : execve / execveat (+ compat) lewat do_execveat_common ----------
+          def exec_c(s, rel):
+              a = find(s, rel, "static int do_execveat_common(int fd, struct filename *filename,")
+              s = ins_before(s, a, wrap(
+                  "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,\n"
+                  "\t\t\t       void *envp, int *flags);\n"))
+              r = find(s, rel, "\treturn __do_execve_file(fd, filename, argv, envp, flags, NULL);", a)
+              return ins_before(s, r, wrap(
+                  "\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"))
+
+
+          # ---------- fs/open.c : faccessat ----------
+          def open_c(s, rel):
+              a = find(s, rel, "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)")
+              b = find(s, rel, "{\n", a) + 2
+              s = s[:b] + wrap("\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n") + s[b:]
+              return ins_before(s, a, wrap(
+                  "extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n"
+                  "\t\t\t\tint *mode, int *__unused_flags);\n"))
+
+
+          # ---------- fs/read_write.c : read ----------
+          def read_c(s, rel):
+              a = find(s, rel, "SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)")
+              r = find(s, rel, "\treturn ksys_read(fd, buf, count);", a)
+              s = ins_before(s, r, wrap(
+                  "\tif (unlikely(ksu_vfs_read_hook))\n"
+                  "\t\tksu_handle_sys_read(fd, &buf, &count);\n"))
+              return ins_before(s, a, wrap(
+                  "extern bool ksu_vfs_read_hook __read_mostly;\n"
+                  "extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr,\n"
+                  "\t\t\t       size_t *count_ptr);\n"))
+
+
+          # ---------- fs/stat.c : newfstatat ----------
+          def stat_c(s, rel):
+              a = find(s, rel, "SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,")
+              r = find(s, rel, "\terror = vfs_fstatat(dfd, filename, &stat, flag);", a)
+              s = ins_before(s, r, wrap("\tksu_handle_stat(&dfd, &filename, &flag);\n"))
+              return ins_before(s, a, wrap(
+                  "extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n"))
+
+
+          # ---------- drivers/input/input.c : input_event ----------
+          def input_c(s, rel):
+              a = find(s, rel, "void input_event(struct input_dev *dev,")
+              k = "\tunsigned long flags;\n"
+              b = find(s, rel, k, a) + len(k)
+              s = s[:b] + wrap(
+                  "\tif (unlikely(ksu_input_hook))\n"
+                  "\t\tksu_handle_input_handle_event(&type, &code, &value);\n") + s[b:]
+              return ins_before(s, a, wrap(
+                  "extern bool ksu_input_hook __read_mostly;\n"
+                  "extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n"))
+
+
+          # ---------- kernel/reboot.c : reboot (jalur supercall / manager) ----------
+          def reboot_c(s, rel):
+              a = find(s, rel, "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,")
+              k = "\tint ret = 0;\n"
+              b = find(s, rel, k, a) + len(k)
+              s = s[:b] + wrap("\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n") + s[b:]
+              return ins_before(s, a, wrap(
+                  "extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n"))
+
+
+          patch("fs/exec.c", exec_c)
+          patch("fs/open.c", open_c)
+          patch("fs/read_write.c", read_c)
+          patch("fs/stat.c", stat_c)
+          patch("drivers/input/input.c", input_c)
+          patch("kernel/reboot.c", reboot_c)
+          print("[hook] semua hook terpasang")
           PYEOF
-          python3 -I "$RUNNER_TEMP/fixups.py"
+          cd kernel
+          python3 -I "$RUNNER_TEMP/ksu_hooks.py" "$PWD"
+          echo "=== hasil sisipan ==="
+          grep -rn "KSU manual hook" fs kernel drivers/input | head -40
 
-          # --- laporan hunk yang masih gagal (hanya .rej BARU, bukan bawaan repo) ---
-          find . -name '*.rej' -not -path './.git/*' | sort > ../result/rej_after.txt
-          comm -13 ../result/rej_before.txt ../result/rej_after.txt > ../result/rej_new.txt
-          n=$(wc -l < ../result/rej_new.txt)
-          echo "rejects=$n" >> "$GITHUB_OUTPUT"
-          echo "file .rej baru tersisa: $n"
-          if [ "$n" -gt 0 ]; then
-            mkdir -p ../result/rejects
-            while read -r f; do
-              mkdir -p "../result/rejects/$(dirname "$f")"
-              cp "$f" "../result/rejects/$f"
-              echo
-              echo "################ REJ: $f ################"
-              cat "$f"
-            done < ../result/rej_new.txt
-            echo
-            echo "::error::$n file punya hunk gagal (isi lengkap ada di teks di atas)"
+      - name: Build kernel
+        env:
+          ROOT_MODE: ${{ inputs.root }}
+          SUSFS: ${{ inputs.susfs }}
+          KPM: ${{ inputs.kpm }}
+          ADBROOT: ${{ inputs.adbroot }}
+        run: |
+          cd kernel
+          OUT=out
+          MK=(
+            ARCH=arm64 CC=clang
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            LLVM_IAS=1 LLVM=1
+            O=$OUT
+          )
+          if [ "$ROOT_MODE" = "sukisu" ]; then
+            MK+=("KCFLAGS=-DKSU_NO_PREINIT")
+          fi
+          JOBS="$(nproc --all)"
+
+          # 1. config dasar milik Hana (sama dengan build resmi mereka)
+          make "${MK[@]}" vendor/renoir_defconfig
+
+          # 2. atur root
+          case "$ROOT_MODE" in
+            sukisu)
+              ./scripts/config --file $OUT/.config -e KSU -d KSU_DEBUG
+              if [ "$SUSFS" = "true" ]; then
+                ./scripts/config --file $OUT/.config -e KSU_SUSFS \
+                  -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT -e KSU_SUSFS_SUS_KSTAT \
+                  -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_ENABLE_LOG -e KSU_SUSFS_OPEN_REDIRECT \
+                  -e KSU_SUSFS_SUS_MAP
+              else
+                ./scripts/config --file $OUT/.config -d KSU_SUSFS
+              fi
+              if [ "$KPM" = "true" ]; then
+                ./scripts/config --file $OUT/.config -e KPM
+              else
+                ./scripts/config --file $OUT/.config -d KPM
+              fi
+              if [ "$ADBROOT" = "true" ]; then
+                ./scripts/config --file $OUT/.config -e KSU_FEATURE_ADBROOT
+              else
+                ./scripts/config --file $OUT/.config -d KSU_FEATURE_ADBROOT
+              fi
+              ;;
+            none)
+              ./scripts/config --file $OUT/.config -d KSU
+              ;;
+            ksunext)
+              echo "Mode ksunext: pakai config Hana apa adanya"
+              ;;
+          esac
+          make "${MK[@]}" olddefconfig
+
+          echo "=== Cek config penting ==="
+          grep -E "^(# )?CONFIG_(KSU|KPM|KPROBES|LTO_CLANG|CFI_CLANG|LOCALVERSION|MODVERSIONS)[A-Z_]*[= ]" $OUT/.config || true
+          if [ "$ROOT_MODE" = "sukisu" ]; then
+            grep -q "^CONFIG_KSU=y" $OUT/.config || { echo "::error::CONFIG_KSU tidak aktif"; exit 1; }
+            if [ "$SUSFS" = "true" ]; then
+              if ! grep -q "^CONFIG_KSU_SUSFS=y" $OUT/.config; then
+                echo "::error::CONFIG_KSU_SUSFS tidak aktif setelah olddefconfig (kemungkinan 'depends on' tidak terpenuhi). Baris terkait:"
+                grep -n "KSU_SUSFS" $OUT/.config || true
+                exit 1
+              fi
+            else
+              if grep -q "^CONFIG_KSU_SUSFS=y" $OUT/.config; then echo "::error::KSU_SUSFS masih aktif padahal susfs=false"; exit 1; fi
+            fi
+            if [ "$KPM" = "true" ]  && ! grep -q "^CONFIG_KPM=y" $OUT/.config; then echo "::warning::KPM diminta tapi CONFIG_KPM tidak aktif (dependensi tidak terpenuhi)"; fi
+            if [ "$ADBROOT" = "true" ] && ! grep -q "^CONFIG_KSU_FEATURE_ADBROOT=y" $OUT/.config; then echo "::warning::ADBROOT diminta tapi CONFIG_KSU_FEATURE_ADBROOT tidak aktif"; fi
+          fi
+
+          # 3. siapkan file otomatis (compile.h, flask.h) supaya driver bisa diperiksa sendirian
+          if ! make "${MK[@]}" -j"$JOBS" prepare scripts > prep.log 2>&1; then
+            echo "prepare gagal:"; tail -n 40 prep.log; exit 1
+          fi
+          make "${MK[@]}" -k -j"$JOBS" init/version.o security/selinux/ > gen.log 2>&1 || true
+          if [ ! -f $OUT/include/generated/compile.h ] || [ ! -f $OUT/security/selinux/flask.h ]; then
+            echo "::error::compile.h / flask.h tidak terbentuk. 40 baris terakhir gen.log:"
+            tail -n 40 gen.log
             exit 1
           fi
 
-      - name: Kompatibilitas dengan SukiSU (tambah stub yang hilang)
+          # 4. periksa driver root dulu, tampilkan SEMUA error sekaligus
+          if [ "$ROOT_MODE" = "sukisu" ]; then
+            echo "=== Kompilasi drivers/kernelsu (semua error sekaligus) ==="
+            make "${MK[@]}" -k -j"$JOBS" drivers/kernelsu/ > ksu.log 2>&1 || true
+            grep -n "^-- " ksu.log | head -20 || true
+            echo "===================== SEMUA ERROR drivers/kernelsu ====================="
+            grep -nE "error:|fatal error|undefined" ksu.log | head -80 || true
+            if grep -qE "error:|fatal error" ksu.log; then
+              echo "::error::Masih ada error di driver SukiSU (lihat daftar di atas)."
+              exit 1
+            fi
+            echo "drivers/kernelsu lolos kompilasi."
+
+            if [ "$SUSFS" = "true" ]; then
+              echo "=== Kompilasi file SUSFS di kernel (semua error sekaligus) ==="
+              make "${MK[@]}" -k -j"$JOBS" fs/susfs.o fs/namei.o fs/namespace.o fs/stat.o fs/readdir.o \
+                fs/statfs.o fs/proc/ fs/notify/ security/selinux/ kernel/sys.o kernel/reboot.o kernel/kallsyms.o \
+                mm/memory.o drivers/input/input.o > susfs.log 2>&1 || true
+              grep -nE "error:|fatal error" susfs.log | head -80 || true
+              if grep -qE "error:|fatal error" susfs.log; then
+                echo "::error::Ada error di file yang disentuh SUSFS (lihat daftar di atas)."
+                exit 1
+              fi
+              echo "File SUSFS lolos kompilasi."
+            fi
+          fi
+
+          # 5. build penuh
+          if ! make "${MK[@]}" -j"$JOBS" > build.log 2>&1; then
+            echo "Build gagal. Ulang 1 thread untuk menampilkan error asli..."
+            make "${MK[@]}" -j1 > build-retry.log 2>&1 || true
+            echo "===================== BARIS ERROR ====================="
+            grep -nE "error:|Error |\*\*\*|No rule|undefined|not found|fatal" build.log build-retry.log | head -40
+            echo "================= 40 BARIS TERAKHIR ==================="
+            tail -n 40 build-retry.log
+            exit 1
+          fi
+
+          IMG=$OUT/arch/arm64/boot/Image
+          test -s "$IMG" || { echo "::error::Image tidak ada"; exit 1; }
+          file "$IMG"
+          file "$IMG" | grep -qi "ARM64" || { echo "::error::Image bukan ARM64"; exit 1; }
+          ls -la "$IMG"
+          cat $OUT/include/config/kernel.release
+
+          if [ "$ROOT_MODE" = "sukisu" ]; then
+            echo "=== cek hook SukiSU di kernel jadi ==="
+            n=$(llvm-nm $OUT/vmlinux 2>/dev/null | grep -c "ksu_handle_" || true)
+            echo "simbol ksu_handle_* di vmlinux: $n"
+            [ "$n" -gt 0 ] || echo "::warning::simbol ksu_handle_ tidak terlihat (bisa karena LTO meng-inline); cek log saat boot"
+            if [ "$SUSFS" = "true" ]; then
+              s=$(llvm-nm $OUT/vmlinux 2>/dev/null | grep -c "susfs_" || true)
+              echo "simbol susfs_* di vmlinux: $s"
+              [ "$s" -gt 0 ] || echo "::warning::simbol susfs_ tidak terlihat di vmlinux (LTO bisa meng-inline); cek di aplikasi manager"
+            fi
+          fi
+
+      - name: Bungkus ZIP AnyKernel3 (pakai template resmi Hana)
+        env:
+          ROOT_MODE: ${{ inputs.root }}
+          SUSFS: ${{ inputs.susfs }}
         run: |
           set -e
-          cd hana
-          SK="$GITHUB_WORKSPACE/suki/kernel"
-
-          # Fungsi dianggap ADA kalau didefinisikan di SUSFS kernel (Hana) ATAU di source .c SukiSU sendiri
-          # (mis. susfs_set_sid / susfs_is_current_zygote_domain didefinisikan di drivers/kernelsu/selinux/selinux.c)
-          in_susfs() { grep -qw "$1" fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; }
-          in_suki_def() {
-            grep -rhE "^[A-Za-z_][^;(]*[ *]$1\(" "$SK" --include=*.c 2>/dev/null | grep -qvE '^extern ' 
-          }
-          have() { in_susfs "$1" || in_suki_def "$1"; }
-
-          add_decl() {
-            python3 - "$1" <<'PY'
-          import sys
-          p = "include/linux/susfs.h"
-          s = open(p).read()
-          i = s.rfind("#endif")
-          s = s[:i] + sys.argv[1] + "\n" + s[i:]
-          open(p, "w").write(s)
-          PY
-          }
-
-          # Fungsi SUSFS yang dipanggil SukiSU tapi tidak ada di SUSFS lama
-          if ! have susfs_parse_priority_app_strings; then
-            echo "tambah stub susfs_parse_priority_app_strings"
-            cat >> fs/susfs.c <<'EOF'
-
-          /* stub kompatibilitas (workflow): SukiSU memanggil ini; filter prioritas tidak aktif */
-          void susfs_parse_priority_app_strings(void) { }
-          EOF
-            add_decl "void susfs_parse_priority_app_strings(void);"
-          fi
-          if ! have susfs_set_priority_uid_filter; then
-            echo "tambah stub susfs_set_priority_uid_filter"
-            cat >> fs/susfs.c <<'EOF'
-
-          /* stub kompatibilitas (workflow): filter prioritas tidak aktif */
-          void susfs_set_priority_uid_filter(void __user **user_info) { }
-          EOF
-            add_decl "void susfs_set_priority_uid_filter(void __user **user_info);"
-          fi
-          # helper string standar SUSFS (implementasi sama dengan SUSFS upstream)
-          if ! have susfs_starts_with; then
-            echo "tambah susfs_starts_with"
-            cat >> fs/susfs.c <<'EOF'
-
-          bool susfs_starts_with(const char *str, const char *prefix)
-          {
-                  while (*prefix) {
-                          if (*str++ != *prefix++)
-                                  return false;
-                  }
-                  return true;
-          }
-          EOF
-            add_decl "bool susfs_starts_with(const char *str, const char *prefix);"
-          fi
-          if ! have susfs_ends_with; then
-            echo "tambah susfs_ends_with"
-            cat >> fs/susfs.c <<'EOF'
-
-          bool susfs_ends_with(const char *str, const char *suffix)
-          {
-                  size_t str_len = strlen(str);
-                  size_t suffix_len = strlen(suffix);
-
-                  if (suffix_len > str_len)
-                          return false;
-                  return !strcmp(str + str_len - suffix_len, suffix);
-          }
-          EOF
-            add_decl "bool susfs_ends_with(const char *str, const char *suffix);"
-          fi
-          if ! grep -qw CMD_SUSFS_SET_PRIORITY_UID_FILTER include/linux/susfs_def.h; then
-            echo "tambah define CMD_SUSFS_SET_PRIORITY_UID_FILTER"
-            python3 - <<'PY'
-          p = "include/linux/susfs_def.h"
-          s = open(p).read()
-          i = s.rfind("#endif")
-          add = "#ifndef CMD_SUSFS_SET_PRIORITY_UID_FILTER\n#define CMD_SUSFS_SET_PRIORITY_UID_FILTER 0x555ff\n#endif\n"
-          s = s[:i] + add + s[i:]
-          open(p, "w").write(s)
-          PY
-          fi
-
-          echo "=== cek semua fungsi susfs_* yang dipanggil SukiSU ==="
-          miss=0
-          for f in $(grep -rhoE '\bsusfs_[a-z0-9_]+\(' "$SK" | tr -d '(' | sort -u); do
-            if have "$f"; then
-              echo "ok   $f"
-            else
-              echo "::error::fungsi hilang: $f"; miss=1
-            fi
-          done
-          echo "=== cek semua konstanta CMD_SUSFS_* / SUSFS_MAGIC ==="
-          for c in $(grep -rhoE '\b(CMD_SUSFS_[A-Z0-9_]+|SUSFS_MAGIC)\b' "$SK" | sort -u); do
-            if ! grep -qw "$c" include/linux/susfs_def.h include/linux/susfs.h; then
-              echo "::error::konstanta hilang: $c"; miss=1
-            fi
-          done
-          [ "$miss" = 0 ] || { echo "::error::API SUSFS belum cocok dengan SukiSU (daftar di atas)"; exit 1; }
-          echo "API SUSFS cocok dengan SukiSU."
-
-      - name: Cek bentrok hook ganda
-        run: |
-          cd hana
-          echo "Definisi ksu_handle_* yang ada di kernel setelah patch:"
-          grep -rn "ksu_handle_[a-z_]*(" fs kernel drivers/input mm security 2>/dev/null | head -40 || true
-          echo "Pastikan workflow kernel TIDAK menjalankan hook manual saat SUSFS aktif."
-          grep -rn "KSU manual hook" fs kernel drivers/input 2>/dev/null && \
-            { echo "::error::ada hook manual lama di tree"; exit 1; } || true
-
-      - name: Susun patch final (terhadap commit Hana ini)
-        run: |
-          set -e
-          cd hana
-          find . -name '*.orig' -not -path './.git/*' -delete
-          git add -A
-          git diff --cached --no-color > ../result/susfs-hana.patch
-          cd ..
-          test -s result/susfs-hana.patch
-          grep -q "^+++ b/fs/susfs.c" result/susfs-hana.patch
-          {
-            echo "SUSFS patch untuk Hana renoir"
-            echo "dibuat    : $(date -u +%F' '%T) UTC"
-            echo "target    : ponces/android_kernel_xiaomi_sm8350-miui @ $(git -C hana rev-parse HEAD)"
-            echo "kernel    : $(make -C hana -s kernelversion 2>/dev/null)"
-            echo "sumber    : ${{ inputs.susfs_repo }} @ $(git -C src rev-parse HEAD)"
-            echo "dasar     : ${{ inputs.base_repo }} @ $(git -C base rev-parse HEAD)"
-            echo "sukisu    : ${{ inputs.suki_ref }} @ $(git -C suki rev-parse HEAD)"
-            echo "SUSFS     : $(grep -h 'define SUSFS_VERSION' hana/include/linux/susfs.h | cut -d' ' -f3)"
-            echo "terapkan  : cd <root kernel> && patch -p1 --no-backup-if-mismatch < susfs-hana.patch"
-          } > result/susfs-hana.info
-          cat result/susfs-hana.info
-          diffstat result/susfs-hana.patch 2>/dev/null | tail -40 || git -C hana diff --cached --stat | tail -40
-          sha256sum result/susfs-hana.patch | tee result/susfs-hana.sha256
+          cd kernel
+          KVER=$(make -s kernelversion)
+          TAG="$ROOT_MODE"
+          if [ "$ROOT_MODE" = "sukisu" ] && [ "$SUSFS" = "true" ]; then TAG="sukisu-susfs"; fi
+          NAME="Hana-${TAG}-renoir-$(date +%Y%m%d)-${KVER}"
+          rm -rf "$GITHUB_WORKSPACE/ak3"
+          cp -r scripts/ak3 "$GITHUB_WORKSPACE/ak3"
+          cp out/arch/arm64/boot/Image "$GITHUB_WORKSPACE/ak3/Image"
+          (cd "$GITHUB_WORKSPACE/ak3" && zip -q -r9 "$GITHUB_WORKSPACE/$NAME.zip" .)
+          mkdir -p "$GITHUB_WORKSPACE/result"
+          mv "$GITHUB_WORKSPACE/$NAME.zip" "$GITHUB_WORKSPACE/result/"
+          cp out/.config "$GITHUB_WORKSPACE/result/config.txt"
+          cp out/include/config/kernel.release "$GITHUB_WORKSPACE/result/" || true
+          (cd "$GITHUB_WORKSPACE/result" && sha256sum *.zip > zip.sha256 && ls -la)
+          unzip -l "$GITHUB_WORKSPACE/result/$NAME.zip" | head -30
 
       - name: Upload hasil
+        uses: actions/upload-artifact@v4
+        with:
+          name: Renoir-Hana-${{ inputs.root }}
+          path: result/
+          if-no-files-found: error
+
+      - name: Upload log build
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: susfs-hasil
-          path: result/
+          name: build-log
+          path: kernel/*.log
           if-no-files-found: ignore
-
-      - name: Publikasikan ke release susfs-hana-latest
-        if: ${{ success() && inputs.publish }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -e
-          gh release delete susfs-hana-latest --cleanup-tag -y --repo "$GITHUB_REPOSITORY" || true
-          gh release create susfs-hana-latest \
-            result/susfs-hana.patch result/susfs-hana.info result/susfs-hana.sha256 \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "SUSFS patch untuk Hana (terbaru)" \
-            --notes-file result/susfs-hana.info
-          echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/susfs-hana-latest"
