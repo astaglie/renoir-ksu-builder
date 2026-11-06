@@ -216,6 +216,11 @@ jobs:
             echo "::error::patch SUSFS ada hunk gagal. Jalankan ulang workflow 'Build SUSFS patch' dengan kernel_ref yang sama."
             exit 1
           fi
+          # fs/proc/task_mmu.c: struktur di sumber SUSFS jauh beda dari Hana, hasil tempelannya merusak
+          # fungsi show_smaps_rollup. Kembalikan ke aslinya (fitur sus_map di smaps jadi tidak aktif,
+          # fitur SUSFS lain tetap jalan). Aman walau patch di release sudah tidak memuat file ini.
+          git checkout -- fs/proc/task_mmu.c
+          echo "fs/proc/task_mmu.c dikembalikan ke aslinya."
           test -f fs/susfs.c || { echo "::error::fs/susfs.c tidak ada setelah patch"; exit 1; }
           echo "Patch SUSFS terpasang."
 
