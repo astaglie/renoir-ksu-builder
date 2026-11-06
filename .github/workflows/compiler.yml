@@ -31,12 +31,17 @@ on:
         required: true
         type: boolean
         default: false
+      suki_latest:
+        description: "EKSPERIMEN: pakai SukiSU terbaru (dari suki_ref) + SUSFS. Kalau gagal, matikan lagi."
+        required: true
+        type: boolean
+        default: false
       kernel_ref:
         description: "Branch/tag kernel Hana"
         required: true
         default: "main"
       suki_ref:
-        description: "Branch/commit SukiSU-Ultra asli (dipakai HANYA kalau susfs tidak dicentang)"
+        description: "Branch/commit SukiSU-Ultra asli (dipakai kalau susfs tidak dicentang, atau kalau suki_latest dicentang)"
         required: true
         default: "builtin"
       susfs_src_repo:
@@ -93,6 +98,7 @@ jobs:
         env:
           SUKI_REF: ${{ inputs.suki_ref }}
           SUSFS: ${{ inputs.susfs }}
+          LATEST: ${{ inputs.suki_latest }}
           SRC_REPO: ${{ inputs.susfs_src_repo }}
           SRC_REF: ${{ inputs.susfs_src_ref }}
         run: |
@@ -102,7 +108,7 @@ jobs:
           # drivers/kernelsu adalah symlink ke ../KernelSU-Next/kernel (bawaan Hana).
           # Isi folder KernelSU-Next kita ganti, symlink tetap dipakai.
           rm -rf KernelSU-Next
-          if [ "$SUSFS" = "true" ]; then
+          if [ "$SUSFS" = "true" ] && [ "$LATEST" != "true" ]; then
             # SukiSU upstream memanggil API SUSFS dengan bentuk berbeda dari SUSFS 5.4 yang kita pakai.
             # Pakai drivers/kernelsu dari repo sumber SUSFS, yang sudah disesuaikan dan terbukti compile bersama.
             echo "Sumber root: $SRC_REPO @ $SRC_REF"
@@ -233,6 +239,79 @@ jobs:
               echo "::warning::tidak ketemu definisi $f di SukiSU (kalau nanti error link 'undefined', ini penyebabnya)"
             fi
           done
+
+      - name: Adaptasi SukiSU terbaru ke SUSFS 2.2.0 (eksperimen)
+        if: ${{ inputs.root == 'sukisu' && inputs.susfs && inputs.suki_latest }}
+        run: |
+          set -e
+          cd kernel
+          K=KernelSU-Next/kernel
+
+          # 1. dispatch.c: enam fungsi SUSFS 2.2.0 meminta pointer bertipe struct, bukan void **.
+          D=$(find "$K" -name dispatch.c | head -1)
+          test -n "$D" || { echo "::error::dispatch.c tidak ditemukan"; exit 1; }
+          sed -i -E 's/\b(susfs_(add_sus_kstat|update_sus_kstat|add_sus_kstat_statically|set_uname|set_cmdline_or_bootconfig|add_open_redirect))\(arg\)/\1(*arg)/g' "$D"
+          echo "=== pemanggilan susfs_* di dispatch.c setelah penyesuaian ==="
+          grep -nE "susfs_(add_sus_kstat|update_sus_kstat|add_sus_kstat_statically|set_uname|set_cmdline_or_bootconfig|add_open_redirect)\(" "$D" || true
+
+          # 2. fungsi yang dipanggil SukiSU terbaru tapi belum ada di SUSFS 2.2.0
+          add_decl() {
+            python3 - "$1" <<'PY'
+          import sys
+          p = "include/linux/susfs.h"
+          s = open(p).read()
+          i = s.rfind("#endif")
+          s = s[:i] + sys.argv[1] + "\n" + s[i:]
+          open(p, "w").write(s)
+          PY
+          }
+          have() { grep -qw "$1" fs/susfs.c include/linux/susfs.h; }
+
+          # proses ditandai tanpa su: pada SUSFS 2.2.0 ini sama dengan menandai "umounted"
+          # (susfs_set_current_proc_umounted sudah dipakai sucompat.c versi W200DS untuk tujuan yang sama)
+          if ! have susfs_set_current_proc_no_su; then
+            cat >> fs/susfs.c <<'EOF'
+
+          /* adaptasi (workflow): SukiSU terbaru memanggil ini; di SUSFS 2.2.0 setara dengan umounted */
+          void susfs_set_current_proc_no_su(void)
+          {
+                  susfs_set_current_proc_umounted();
+          }
+          EOF
+            add_decl "void susfs_set_current_proc_no_su(void);"
+          fi
+          if ! have susfs_set_current_proc_umounted_for_zygote_next; then
+            cat >> fs/susfs.c <<'EOF'
+
+          /* adaptasi (workflow): proses zygote_next ditandai sama dengan umounted */
+          void susfs_set_current_proc_umounted_for_zygote_next(void)
+          {
+                  susfs_set_current_proc_umounted();
+          }
+          EOF
+            add_decl "void susfs_set_current_proc_umounted_for_zygote_next(void);"
+          fi
+          # penyembunyian lewat tipe SELinux: tidak ada di SUSFS 2.2.0. Dijadikan tidak aktif
+          # (macro menerima argumen apa pun, karena tanda tangan aslinya tidak diketahui).
+          for fn in susfs_add_sus_type susfs_add_sus_avd_allowed_by_type; do
+            if ! have "$fn"; then
+              add_decl "#ifndef $fn"
+              add_decl "#define $fn(...) (-EOPNOTSUPP)"
+              add_decl "#endif"
+            fi
+          done
+
+          # 3. ksud.c: pemanggilan ksu_selinux_hide_* tanpa prototipe. Beri prototipe + isi kosong lemah
+          #    (weak): kalau ada definisi asli di tempat lain, itu yang dipakai; kalau tidak ada, tidak melakukan apa-apa.
+          KS=$(find "$K" -name ksud.c | head -1)
+          if [ -n "$KS" ] && grep -q "ksu_selinux_hide_handle_post_fs_data" "$KS"; then
+            if ! grep -rq "ksu_selinux_hide_handle_post_fs_data(void)" "$K"; then
+              line=$(grep -n '^#include' "$KS" | tail -1 | cut -d: -f1)
+              sed -i "${line}a /* adaptasi (workflow) */\nvoid __weak ksu_selinux_hide_handle_post_fs_data(void) { }\nvoid __weak ksu_selinux_hide_handle_second_stage(void) { }" "$KS"
+              echo "prototipe+weak ksu_selinux_hide_* ditambahkan ke $KS"
+            fi
+          fi
+          echo "Adaptasi selesai."
 
       - name: Pasang hook manual SukiSU ke kernel (exec, faccessat, stat, read, input, reboot)
         if: ${{ inputs.root == 'sukisu' && !inputs.susfs }}
