@@ -301,16 +301,6 @@ jobs:
             fi
           done
 
-          # 3. ksud.c: pemanggilan ksu_selinux_hide_* tanpa prototipe. Beri prototipe + isi kosong lemah
-          #    (weak): kalau ada definisi asli di tempat lain, itu yang dipakai; kalau tidak ada, tidak melakukan apa-apa.
-          KS=$(find "$K" -name ksud.c | head -1)
-          if [ -n "$KS" ] && grep -q "ksu_selinux_hide_handle_post_fs_data" "$KS"; then
-            if ! grep -rq "ksu_selinux_hide_handle_post_fs_data(void)" "$K"; then
-              line=$(grep -n '^#include' "$KS" | tail -1 | cut -d: -f1)
-              sed -i "${line}a /* adaptasi (workflow) */\nvoid __weak ksu_selinux_hide_handle_post_fs_data(void) { }\nvoid __weak ksu_selinux_hide_handle_second_stage(void) { }" "$KS"
-              echo "prototipe+weak ksu_selinux_hide_* ditambahkan ke $KS"
-            fi
-          fi
           echo "Adaptasi selesai."
 
       - name: Pasang hook manual SukiSU ke kernel (exec, faccessat, stat, read, input, reboot)
