@@ -346,6 +346,18 @@ jobs:
           PY
           fi
 
+          # variabel work_struct yang diperlukan lsm_hook.c ("extra works" SUSFS terbaru, dijadwalkan setelah umount).
+          # Tidak ada di SUSFS 2.2.0, jadi dibuat sebagai pekerjaan kosong yang sudah terinisialisasi.
+          if ! have susfs_extra_works; then
+            cat >> fs/susfs.c <<'EOF'
+
+          /* adaptasi (workflow): pekerjaan tambahan SUSFS terbaru tidak ada di 2.2.0 -> kosong */
+          #include <linux/workqueue.h>
+          static void susfs_extra_works_fn(struct work_struct *work) { }
+          DECLARE_WORK(susfs_extra_works, susfs_extra_works_fn);
+          EOF
+          fi
+
           # pemeriksaan dini: setiap susfs_*() yang dipanggil SukiSU harus ada (di kernel atau didefinisikan SukiSU sendiri)
           echo "=== cek fungsi susfs_* yang dipanggil SukiSU terbaru ==="
           miss=0
@@ -600,6 +612,27 @@ jobs:
                 exit 1
               fi
               echo "File SUSFS lolos kompilasi."
+
+              # simbol susfs_* (fungsi MAUPUN variabel) yang dipakai tapi tidak didefinisikan di mana pun.
+              # Diperiksa dari file objek supaya ketahuan sebelum link penuh (yang makan puluhan menit).
+              echo "=== cek simbol susfs_* di file objek (sebelum link penuh) ==="
+              if command -v llvm-nm >/dev/null 2>&1; then
+                OBJS=$(find $OUT/drivers/kernelsu $OUT/fs $OUT/kernel $OUT/security $OUT/mm $OUT/drivers/input -name '*.o' 2>/dev/null)
+                need=$(echo "$OBJS" | xargs -r llvm-nm -u 2>/dev/null | awk 'NF==2 && $1=="U"{print $2}' | grep '^susfs_' | sort -u || true)
+                defd=$(echo "$OBJS" | xargs -r llvm-nm --defined-only 2>/dev/null | awk 'NF==3{print $3}' | grep '^susfs_' | sort -u || true)
+                miss=0
+                for sym in $need; do
+                  if echo "$defd" | grep -qx "$sym"; then
+                    echo "ok   $sym"
+                  else
+                    echo "::error::simbol tidak terdefinisi: $sym"; miss=1
+                  fi
+                done
+                [ "$miss" = 0 ] || { echo "::error::ada simbol susfs_* yang tidak terdefinisi (daftar di atas)"; exit 1; }
+                echo "semua simbol susfs_* terdefinisi."
+              else
+                echo "llvm-nm tidak tersedia, pemeriksaan simbol dilewati"
+              fi
             fi
           fi
 
