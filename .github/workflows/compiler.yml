@@ -291,15 +291,74 @@ jobs:
           EOF
             add_decl "void susfs_set_current_proc_umounted_for_zygote_next(void);"
           fi
-          # penyembunyian lewat tipe SELinux: tidak ada di SUSFS 2.2.0. Dijadikan tidak aktif
-          # (macro menerima argumen apa pun, karena tanda tangan aslinya tidak diketahui).
-          for fn in susfs_add_sus_type susfs_add_sus_avd_allowed_by_type; do
-            if ! have "$fn"; then
-              add_decl "#ifndef $fn"
-              add_decl "#define $fn(...) (-EOPNOTSUPP)"
-              add_decl "#endif"
+
+          # penyembunyian lewat tipe SELinux: tidak ada di SUSFS 2.2.0, jadi dibuat tidak aktif.
+          # Tanda tangan DIBACA dari kernel/selinux/sepolicy.c milik SukiSU (baris extern di bagian atas file).
+          if ! have susfs_add_sus_avd_allowed_by_type; then
+            cat >> fs/susfs.c <<'EOF'
+
+          /* adaptasi (workflow): penyembunyian lewat tipe SELinux tidak ada di SUSFS 2.2.0 -> tidak aktif */
+          int susfs_add_sus_avd_allowed_by_type(u32 s_type, u32 t_type, u16 type, u32 orig_avd_allowed)
+          {
+                  return 0;
+          }
+          EOF
+            add_decl "int susfs_add_sus_avd_allowed_by_type(u32 s_type, u32 t_type, u16 type, u32 orig_avd_allowed);"
+          fi
+          if ! have susfs_add_sus_type; then
+            cat >> fs/susfs.c <<'EOF'
+
+          /* adaptasi (workflow): tidak aktif, lihat catatan di atas */
+          int susfs_add_sus_type(const char *secctx, u32 type_value)
+          {
+                  return 0;
+          }
+          EOF
+            add_decl "int susfs_add_sus_type(const char *secctx, u32 type_value);"
+          fi
+
+          # filter prioritas UID + helper string: dipanggil SukiSU terbaru, tidak ada di SUSFS 2.2.0.
+          # (workflow SUSFS biasanya sudah menambahkannya ke patch; ini hanya jaga-jaga, tidak menggandakan)
+          if ! have susfs_parse_priority_app_strings; then
+            cat >> fs/susfs.c <<'EOF'
+
+          /* adaptasi (workflow): filter prioritas UID tidak aktif */
+          void susfs_parse_priority_app_strings(void) { }
+          EOF
+            add_decl "void susfs_parse_priority_app_strings(void);"
+          fi
+          if ! have susfs_set_priority_uid_filter; then
+            cat >> fs/susfs.c <<'EOF'
+
+          /* adaptasi (workflow): filter prioritas UID tidak aktif */
+          void susfs_set_priority_uid_filter(void __user **user_info) { }
+          EOF
+            add_decl "void susfs_set_priority_uid_filter(void __user **user_info);"
+          fi
+          if ! grep -qw CMD_SUSFS_SET_PRIORITY_UID_FILTER include/linux/susfs_def.h; then
+            python3 - <<'PY'
+          p = "include/linux/susfs_def.h"
+          s = open(p).read()
+          i = s.rfind("#endif")
+          add = "#ifndef CMD_SUSFS_SET_PRIORITY_UID_FILTER\n#define CMD_SUSFS_SET_PRIORITY_UID_FILTER 0x555ff\n#endif\n"
+          s = s[:i] + add + s[i:]
+          open(p, "w").write(s)
+          PY
+          fi
+
+          # pemeriksaan dini: setiap susfs_*() yang dipanggil SukiSU harus ada (di kernel atau didefinisikan SukiSU sendiri)
+          echo "=== cek fungsi susfs_* yang dipanggil SukiSU terbaru ==="
+          miss=0
+          for f in $(grep -rhoE '\bsusfs_[a-z0-9_]+\(' "$K" | tr -d '(' | sort -u); do
+            if grep -qw "$f" fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; then
+              echo "ok   $f"
+            elif grep -rhE "^[A-Za-z_][^;(]*[ *]$f\(" "$K" --include=*.c 2>/dev/null | grep -qvE '^extern '; then
+              echo "ok   $f (didefinisikan SukiSU)"
+            else
+              echo "::error::fungsi hilang: $f"; miss=1
             fi
           done
+          [ "$miss" = 0 ] || { echo "::error::masih ada fungsi SUSFS yang belum tersedia (daftar di atas)"; exit 1; }
 
           echo "Adaptasi selesai."
 
